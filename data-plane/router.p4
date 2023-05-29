@@ -23,6 +23,8 @@ const bit<16> TYPE_IPV6         = 0x86dd;
 const bit<16> TYPE_ARP          = 0x0806;
 const bit<16> TYPE_CPU_METADATA = 0x080a;
 
+const bit<4>  MAX_LSU_ADS_NUM   = 10;
+
 // standard Ethernet header
 header ethernet_t {
     macAddr_t dstAddr;
@@ -30,12 +32,11 @@ header ethernet_t {
     bit<16>   etherType;
 }
 
+//TODO: is this enough data? am I missing something? what I added - info to update forwarding table
 //Header for information sent to the CPU
 header cpu_metadata_t {
- 
- //TODO: Construct the header with the information to send to the CPU
- //This header should be added to all packets sent to the control plane
- 
+    macAddr_t   src_addr;
+    port_t      ingress_port;
 }
 
 //TODO: define all other headers required by the router.
@@ -65,15 +66,53 @@ header ipv4_t {
     ip4Addr_t dstAddr;
 }
 
-struct headers {
-    ethernet_t        ethernet;
-    cpu_metadata_t    cpu_metadata;
-    arp_t             arp;
-    ipv4_t            ipv4;
-    //TODO: add all other supported headers
+header pwospf_t {
+    bit<8>      version;
+    bit<8>      type;
+    bit<16>     pkt_len;
+    bit<32>     router_id;
+    bit<32>     area_id;
+    bit<16>     checksum;
+    bit<16>     au_type;
+    bit<64>     auth;
 }
 
-struct metadata { }
+//TODO: shouldn't this be a union?
+struct headers {
+    ethernet_t          ethernet;
+    cpu_metadata_t      cpu_metadata;
+    arp_t               arp;
+    ipv4_t              ipv4;
+    pwospf_t            pwospf;          
+}
+
+struct hello_metadata_t {
+    bit<32>     network_mask;
+    bit<16>     hello_int;
+    bit<16>     padding;
+}
+
+struct lsu_ad_t {
+    bit<32>     subnet;
+    bit<32>     mask;
+    bit<32>     router_id;
+}
+
+struct lsu_metadata_t {
+    bit<16>     seq_num;
+    bit<16>     TTL;
+    bit<32>     num_of_ads;
+    lsu_ad_t[MAX_LSU_ADS_NUM] lsu_ads;
+}
+
+struct pwospf_metadata_t {
+    hello_metadata_t    hello_metadata;
+    lsu_metadata_t      lsu_metadata;
+}
+
+struct metadata {
+    pwospf_metadata_t   pwospf_metadata;
+}
 
 parser MyParser(packet_in packet,
                 out headers hdr,
