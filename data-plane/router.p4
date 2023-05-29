@@ -5,7 +5,9 @@
 typedef bit<9>  port_t;
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
+//TODO: do we need this? are we supporting IPv6?
 typedef bit<128> ip6Addr_t;
+//TODO: same - is this needed?
 typedef bit<16> mcastGrp_t;
 
 const macAddr_t BROADCAST_ADDR  = 0xffffffffffff;
@@ -77,13 +79,12 @@ header pwospf_t {
     bit<64>     auth;
 }
 
-//TODO: shouldn't this be a union?
 struct headers {
     ethernet_t          ethernet;
+    //TODO: is this needed?
     cpu_metadata_t      cpu_metadata;
     arp_t               arp;
-    ipv4_t              ipv4;
-    pwospf_t            pwospf;          
+    ipv4_t              ipv4;          
 }
 
 struct hello_metadata_t {
@@ -124,9 +125,29 @@ parser MyParser(packet_in packet,
 
     state parse_ethernet {
         packet.extract(hdr.ethernet);
-        // TODO: Parse all the headers supported by the project
-        transition accept;
+        transition select(hdr.ethernet.etherType) {
+            TYPE_IPV4:          parse_ipv4;
+            TYPE_ARP:           pase_arp;
+            TYPE_CPU_METADATA:  parse_cpu;
+            TYPE_IPV6:          accept;
+            //TODO: should this be accept?
+            default:            reject;
         }
+    }
+
+    state parse_ipv4 {
+        packet.extract(hdr.ipv4);
+        transition accept;
+    }
+
+    //TODO: does this type have an ip header?
+    state parse_arp {
+        packet.extract(hdr.arp);
+        transition accept;
+    }
+
+    state parse_cpu {
+        //TODO: not sure what to do here
     }
 }
 
