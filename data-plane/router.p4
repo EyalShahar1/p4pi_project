@@ -5,8 +5,6 @@
 typedef bit<9>  port_t;
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
-//TODO: do we need this? are we supporting IPv6?
-typedef bit<128> ip6Addr_t;
 //TODO: same - is this needed?
 typedef bit<16> mcastGrp_t;
 
@@ -129,8 +127,6 @@ parser MyParser(packet_in packet,
             TYPE_IPV4:          parse_ipv4;
             TYPE_ARP:           pase_arp;
             TYPE_CPU_METADATA:  parse_cpu;
-            TYPE_IPV6:          accept;
-            //TODO: should this be accept?
             default:            reject;
         }
     }
@@ -140,7 +136,6 @@ parser MyParser(packet_in packet,
         transition accept;
     }
 
-    //TODO: does this type have an ip header?
     state parse_arp {
         packet.extract(hdr.arp);
         transition accept;
@@ -168,8 +163,7 @@ control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
             hdr.ipv4.srcAddr,
             hdr.ipv4.dstAddr },
             hdr.ipv4.hdrChecksum,
-            HashAlgorithm.csum16);    
-        // can add more cases if we'll have more packets type with check sum
+            HashAlgorithm.csum16);
         }      
 }
 
@@ -211,7 +205,6 @@ control MyIngress(inout headers hdr,
         standard_metadata.egress_spec = standard_metadata.ingress_port;
     }
   
-//TODO: Add all tables and actions
     // arp table for exact ip address match
     table arp_exact {
         key = {hdr.arp.dst_ip: exact; }
