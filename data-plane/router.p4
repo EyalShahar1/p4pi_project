@@ -14,6 +14,7 @@ const mcastGrp_t BROADCAST_MGID = 0x0001;
 const ip4Addr_t ALLSPFROUTERS_ADDR = 0xe0000005;
 
 const port_t CPU_PORT           = 0x1;
+const bit<8> OSPF_PROT          = 89;
 
 const bit<16> ARP_OP_REQ        = 0x0001;
 const bit<16> ARP_OP_REPLY      = 0x0002;
@@ -218,10 +219,26 @@ control MyIngress(inout headers hdr,
         default_action = drop();
     }
 
+    table ip_protocol_exact {
+        key = {hdr.ip.protocol: exact; }
+
+        actions = {
+            ospf_cpu;
+            // can add more actions for more protocols
+            drop;
+        }
+
+        size = 256;
+        default_action = drop();
+    }
 
     apply {
         //TODO: Add your control flow
         //The following is a dummy code that will return the packet "as is" to the source
+
+        //check the ipv4 protocol 
+        if (hdr.ethernet.isValid() && hdr.ipv4.isValid())// && hdr.ipv4.protocol == OSPF_PROT)
+            ip_protocol_exact.apply();
         standard_metadata.egress_spec = standard_metadata.ingress_port
     }
 }
