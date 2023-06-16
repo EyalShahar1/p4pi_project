@@ -25,10 +25,11 @@ const bit<16> TYPE_CPU_METADATA = 0x080a;
 
 const bit<4>  MAX_LSU_ADS_NUM   = 10;
 
+const bit<16> ARP_REPLY = 2;
 // standard Ethernet header
 header ethernet_t {
-    macAddr_t dstAddr;
-    macAddr_t srcAddr;
+    macAddr_t dst_addr;
+    macAddr_t src_addr;
     bit<16>   etherType;
 }
 
@@ -41,10 +42,10 @@ header cpu_metadata_t {
 
 //TODO: define all other headers required by the router.
 header arp_t {
-  bit<16>   h_type;
-  bit<16>   p_type;
-  bit<8>    h_len;
-  bit<8>    p_len;
+  bit<16>   hardware_type;
+  bit<16>   protocol_type;
+  bit<8>    hardware_len;
+  bit<8>    protocol_len;
   bit<16>   op_code;
   macAddr_t src_mac;
   ip4Addr_t src_ip;
@@ -53,17 +54,17 @@ header arp_t {
   }
 
 header ipv4_t {
-    bit<8>    versionihl;
+    bit<8>    version_ihl;
     bit<8>    diffserv;
     bit<16>   totalLen;
     bit<16>   identification;
     bit<3>    flags;
-    bit<13>   fragOffset;
+    bit<13>   frag_offset;
     bit<8>    ttl;
     bit<8>    protocol;
-    bit<16>   hdrChecksum;
-    ip4Addr_t srcAddr;
-    ip4Addr_t dstAddr;
+    bit<16>   hdr_checksum;
+    ip4Addr_t src_addr;
+    ip4Addr_t dst_addr;
 }
 
 header pwospf_t {
@@ -157,12 +158,12 @@ control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
             hdr.ipv4.totalLen,
             hdr.ipv4.identification,
             hdr.ipv4.flags,
-            hdr.ipv4.fragOffset,
+            hdr.ipv4.frag_offset,
             hdr.ipv4.ttl,
             hdr.ipv4.protocol,
-            hdr.ipv4.srcAddr,
-            hdr.ipv4.dstAddr },
-            hdr.ipv4.hdrChecksum,
+            hdr.ipv4.src_addr,
+            hdr.ipv4.dst_addr },
+            hdr.ipv4.hdr_checksum,
             HashAlgorithm.csum16);
         }      
 }
@@ -198,8 +199,8 @@ control MyIngress(inout headers hdr,
         hdr.arp.src_ip = hdr.arp.dst_ip;
 
         //update ethernet header
-        hdr.ethernet.dstAddr = hdr.ethernet.srcAddr;
-        hdr.ethernet.srcAddr = request_mac;
+        hdr.ethernet.dst_addr = hdr.ethernet.src_addr;
+        hdr.ethernet.src_addr = request_mac;
 
         //send it back to the same port
         standard_metadata.egress_spec = standard_metadata.ingress_port;
@@ -242,12 +243,12 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
               hdr.ipv4.totalLen,
               hdr.ipv4.identification,
               hdr.ipv4.flags,
-              hdr.ipv4.fragOffset,
+              hdr.ipv4.frag_offset,
               hdr.ipv4.ttl,
               hdr.ipv4.protocol,
-              hdr.ipv4.srcAddr,
-              hdr.ipv4.dstAddr },
-            hdr.ipv4.hdrChecksum,
+              hdr.ipv4.src_addr,
+              hdr.ipv4.dst_addr },
+            hdr.ipv4.hdr_checksum,
             HashAlgorithm.csum16);    
         // can add more cases if we'll have more packets type with check sum
         }            
