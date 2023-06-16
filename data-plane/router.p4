@@ -5,7 +5,6 @@
 typedef bit<9>  port_t;
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
-//TODO: same - is this needed?
 typedef bit<16> mcastGrp_t;
 
 const macAddr_t BROADCAST_ADDR  = 0xffffffffffff;
@@ -27,9 +26,9 @@ const bit<4>  MAX_LSU_ADS_NUM   = 10;
 
 // standard Ethernet header
 header ethernet_t {
-    macAddr_t dstAddr;
-    macAddr_t srcAddr;
-    bit<16>   etherType;
+    macAddr_t dst_addr;
+    macAddr_t src_addr;
+    bit<16>   ether_type;
 }
 
 //TODO: is this enough data? am I missing something? what I added - info to update forwarding table
@@ -73,7 +72,7 @@ header pwospf_t {
     bit<32>     router_id;
     bit<32>     area_id;
     bit<16>     checksum;
-    bit<16>     au_type;
+    bit<16>     auth_type;
     bit<64>     auth;
 }
 
@@ -180,8 +179,15 @@ control MyIngress(inout headers hdr,
     }
 
     action send_to_cpu() {
-      //TODO: What should you do here?
+        standard_metadata.egress_spec = CPU_PORT;
     }
+
+    action ipv4_forward(macAddr_t dst_addr, bit<9> port) {
+        standard_metadata.egress_spec = port;
+        hdr.ethernet.dst_addr = dst_addr;
+    }
+
+    action no_action() {}
 
     action arp_reply(macAddr_t request_mac) {
         //now creating an arp reply
@@ -217,11 +223,20 @@ control MyIngress(inout headers hdr,
         default_action = drop();
     }
 
+    table routing_table {
+        key = {hdr.ethernet.dst_ip: lpm; }
+
+        actions = {
+            ipv4_forward;
+            drop;
+            no_action;
+        }
+        size = 256;
+        default_action = no_action();
+    }
 
     apply {
-        //TODO: Add your control flow
-        //The following is a dummy code that will return the packet "as is" to the source
-        standard_metadata.egress_spec = standard_metadata.ingress_port
+        // add applying
     }
 }
 
@@ -256,7 +271,12 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
 control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         packet.emit(hdr.ethernet);
-       //TODO: Add all other headers
+        switch (hdr.ethernet.etherType) {
+            TYPE_IPV4:          { packet.emit(hdr.ipv4); }
+            TYPE_ARP:           { packet.emit(hdr.arp); }
+            TYPE_CPU_METADATA:  { packet.emit(hdr.cpu_metadata); }
+            default:            { }
+        }
     }
 }
 
