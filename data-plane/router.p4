@@ -5,33 +5,19 @@
 typedef bit<9>  port_t;
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
-//NAAMA TODO: maybe not needed
-typedef bit<16> mcastGrp_t;
 
-//NAAMA TODO: is this used?
 const macAddr_t BROADCAST_ADDR  = 0xffffffffffff;
-//NAAMA TODO: maybe not needed
-const mcastGrp_t BROADCAST_MGID = 0x0001;
-
-//NAAMA TODO: is this used?
 const ip4Addr_t ALLSPFROUTERS_ADDR = 0xe0000005;
 
 const port_t CPU_PORT           = 0x1;
-//NAAMA TODO: is this used?
 const bit<8> OSPF_PROT          = 89;
 
 const bit<16> ARP_OP_REQ        = 0x0001;
 const bit<16> ARP_OP_REPLY      = 0x0002;
 
 const bit<16> TYPE_IPV4         = 0x0800;
-//const bit<16> TYPE_IPV6         = 0x86dd;
 const bit<16> TYPE_ARP          = 0x0806;
 const bit<16> TYPE_CPU_METADATA = 0x080a;
-
-//NAAMA TODO: maybe not needed
-const bit<4>  MAX_LSU_ADS_NUM   = 10;
-
-const bit<16> ARP_REPLY = 2;
 
 
 /*****     HEADERS     *****/
@@ -43,10 +29,11 @@ header ethernet_t {
     bit<16>   ether_type;
 }
 
-//NAAMA TODO: might be missing some data and might not need src_addr, tbd
+// TODO - might be missing some data and might not need src_addr, tbd
 // CPU header
-header cpu_metadata_t {
-    macAddr_t   src_addr;
+header cpu_t {
+    // Marks packets used to generate ARP requests
+    bit<1>      is_arp_needed;
     port_t      ingress_port;
 }
 
@@ -80,57 +67,16 @@ header ipv4_t {
     ip4Addr_t dst_addr;
 }
 
-// PWOSPF header - NAAMA TODO - maybe not needed
-header pwospf_t {
-    bit<8>      version;
-    bit<8>      type;
-    bit<16>     pkt_len;
-    bit<32>     router_id;
-    bit<32>     area_id;
-    bit<16>     checksum;
-    bit<16>     auth_type;
-    bit<64>     auth;
-}
-
 // Packet headers
 struct headers {
     ethernet_t          ethernet;
-    cpu_metadata_t      cpu_metadata;
+    cpu_t               cpu;
     arp_t               arp;
     ipv4_t              ipv4;          
 }
 
-// HELLO metadata - NAAMA TODO - maybe not needed
-struct hello_metadata_t {
-    bit<32>     network_mask;
-    bit<16>     hello_int;
-    bit<16>     padding;
-}
-
-// LSU ads - NAAMA TODO - maybe not needed
-struct lsu_ad_t {
-    bit<32>     subnet;
-    bit<32>     mask;
-    bit<32>     router_id;
-}
-
-// LSU metadata - NAAMA TODO - maybe not needed
-struct lsu_metadata_t {
-    bit<16>     seq_num;
-    bit<16>     TTL;
-    bit<32>     num_of_ads;
-    lsu_ad_t[MAX_LSU_ADS_NUM] lsu_ads;
-}
-
-// PWOSPF metadata - NAAMA TODO - maybe not needed
-struct pwospf_metadata_t {
-    hello_metadata_t    hello_metadata;
-    lsu_metadata_t      lsu_metadata;
-}
-
-// metadata struct - NAAMA TODO - maybe not needed
 struct metadata {
-    pwospf_metadata_t   pwospf_metadata;
+    ip4Addr_t next_hop_ip_add;
 }
 
 parser MyParser(packet_in packet,
@@ -162,7 +108,7 @@ parser MyParser(packet_in packet,
     }
 
     state parse_cpu {
-        packet.extract(hdr.cpu_metadata);
+        packet.extract(hdr.cpu);
         transition accept;
     }
 }
@@ -193,10 +139,7 @@ control MyIngress(inout headers hdr,
                   inout metadata meta,
                   inout standard_metadata_t standard_metadata) {
 
-    //NAAMA TODO - is this action used?
-    action set_egr(port_t port) {
-        standard_metadata.egress_spec = port;
-    }
+    /*****     ACTIONS     *****/
     
     action drop() {
         mark_to_drop(standard_metadata);
@@ -206,47 +149,31 @@ control MyIngress(inout headers hdr,
         standard_metadata.egress_spec = CPU_PORT;
     }
 
-    action ipv4_forward(macAddr_t dst_addr, bit<9> port) {
-        standard_metadata.egress_spec = port;
-        hdr.ethernet.dst_addr = dst_addr;
+    action flood() {
+        // TODO - need to figure out how to clone the packet, this is for OSPF and ARP coming from CPU
     }
 
-    //NAAMA TODO - is this needed?
+    action ipv4_forward(ip4Addr_t next_hop, bit<9> port) {
+        standard_metadata.egress_spec = port;
+        meta.next_hop_ip_add = next_hop;
+    }
+
+    action set_dst_mac(macAddr_t dst_mac) {
+        hdr.ethernet.dst_addr = dst_mac;
+    }
+
+    action generate_arp_req() {
+        hdr.cpu.is_arp_needed = is_arp_needed;
+        standard_metadata.egress_spec = CPU_PORT;
+    }
+
+    //TODO - is this needed?
     action no_action() {}
 
-    action arp_reply(macAddr_t request_mac) {
-        // Update operation code from request to reply
-        hdr.arp.op_code = ARP_REPLY;
-        
-        //reply's dst_mac is the request's src mac
-        hdr.arp.dst_mac = hdr.arp.src_mac;
-        
-        //reply's dst_ip is the request's src ip
-        hdr.arp.src_mac = request_mac;
 
-        //reply's src ip is the request's dst ip
-        hdr.arp.src_ip = hdr.arp.dst_ip;
+    /*****     TABLES     *****/
 
-        //update ethernet header
-        hdr.ethernet.dst_addr = hdr.ethernet.src_addr;
-        hdr.ethernet.src_addr = request_mac;
-
-        //send it back to the same port
-        standard_metadata.egress_spec = standard_metadata.ingress_port;
-    }
-  
-    // arp table for exact ip address match - is this supposed to be a table?
-    table arp_exact {
-        key = {hdr.arp.dst_ip: exact; }
-
-        actions = {
-            arp_reply;
-            drop;
-        }
-        size = 256; //can be changed but for now it's fine
-        default_action = drop();
-    }
-
+    // Destination IP address -> next hop IP address, output port
     table routing_table {
         key = {hdr.ethernet.dst_ip: lpm; }
 
@@ -258,30 +185,41 @@ control MyIngress(inout headers hdr,
         default_action = arp_request();
     }
 
-    // table ip_protocol_exact {
-    //     key = {hdr.ip.protocol: exact; }
+    // Next hop IP address -> destination MAC address
+    table arp_table {
+        key = {meta.next_hop_ip_add: exact;}
 
-    //     actions = {
-    //         ospf_cpu;
-    //         // can add more actions for more protocols
-    //         drop;
-    //     }
+        actions = {
+            set_dst_mac;
+            generate_arp_req;
+        }
+    }
 
-    //     size = 256;
-    //     default_action = drop();
-    // }
+
+    /*****     APPLY     *****/
 
     apply {
-        if (!hdr.ethernet.isValid()) {
+        // Invalid packets
+        if (!hdr.ethernet.isValid() || !hdr.ipv4.isValid()) {
             drop();
         }
-        if (hdr.arp.isValid()) {
-            
+
+        // OSPF and ARP packets are always sent to CPU
+        if ((hdr.ethernet.ether_type == TYPE_ARP && standard_metadata.ingress_port != CPU_PORT)
+             || (hdr.ipv4.prot == OSPF_PROT)) {
+            send_to_cpu();
         }
-        if (hdr.ethernet.isValid() && hdr.ipv4.isValid()) {
-            ip_protocol_exact.apply();
+
+        // ARP requests generated by CPU need to be flooded
+        if (hdr.ethernet.ether_type == TYPE_ARP && standard_metadata.ingress_port == CPU_PORT) {
+            flood();
         }
-        standard_metadata.egress_spec = standard_metadata.ingress_port
+
+        // If packet is not from CPU and not ARP/OSPF - apply routing
+        if (hdr.ipv4.isValid()) {
+            routing_table.apply();
+            arp_table.apply();
+        }
     }
 }
 
@@ -320,7 +258,7 @@ control MyDeparser(packet_out packet, in headers hdr) {
         switch (hdr.ethernet.etherType) {
             TYPE_IPV4:          { packet.emit(hdr.ipv4); }
             TYPE_ARP:           { packet.emit(hdr.arp); }
-            TYPE_CPU_METADATA:  { packet.emit(hdr.cpu_metadata); }
+            TYPE_CPU_METADATA:  { packet.emit(hdr.cpu); }
             default:            { }
         }
     }
