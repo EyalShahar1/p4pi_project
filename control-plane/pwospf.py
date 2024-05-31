@@ -1,28 +1,30 @@
+import threading
 from select import select
 from scapy.all import conf, ETH_P_ALL, MTU, plist, Packet, Ether, IP, ARP
 from scapy.packet import Packet, bind_layers
 from threading import Thread
 import queue
 
-
 ARP_OP_REPLY = 0x0002
 ARP_OP_REQ = 0x0001
 ARP_TIMEOUT = 30
 HELLO_TYPE = 0x01
 HELLO_TYPE = 0x01
-ICMP_ECHO_REPLY_CODE = 0x00
-ICMP_ECHO_REPLY_TYPE = 0x00
-ICMP_HOST_UNREACHABLE_CODE = 0x01
-ICMP_HOST_UNREACHABLE_TYPE = 0x03
-ICMP_PROT_NUM = 0x01
 LSU_TYPE = 0x04
-OSPF_PROT_NUM = 0x59
 OSPF_PROT_NUM = 0x59
 PWOSPF_HELLO_DEST = '224.0.0.5'
 TYPE_CPU_METADATA = 0x080a
 
 # Naama - can also be 0xffffffff
 INVALID_ROUTER_ID = 0
+
+# Global variables
+arp_in_queue = queue.Queue()
+arp_out_queue = queue.Queue()
+hello_in_queue = queue.Queue()
+hello_out_queue = queue.Queue()
+lsu_in_queue = queue.Queue()
+lsu_out_queue = queue.Queue()
 
 # READ THIS FIRST
 # The way this works as far as I can understand - the router controller holds all the info of the router -
@@ -31,9 +33,10 @@ INVALID_ROUTER_ID = 0
 # and an LSU manager (thread) that creates all LSA packets.
 
 
-# Naama - seems like this is a func to receive packets from socket/port, prn is a func to apply to packets
-# returns a list of packets named sniff
+# This function "sniffs" for packets.
+# TODO - think if we want to open and close the socket, or write prn func to add the packet to some queue
 def sniff(store=False, prn=None, lfilter=None, stop_event=None, refresh=.1, *args, **kwargs):
+    # Listen for packets
     s = conf.L2listen(type=ETH_P_ALL, *args, **kwargs)
     lst = []
     try:
@@ -42,12 +45,15 @@ def sniff(store=False, prn=None, lfilter=None, stop_event=None, refresh=.1, *arg
                 break
             sel = select([s], [], [], refresh)
             if s in sel[0]:
+                # Receive data from socket as bytes object, MTU "infinite"
                 p = s.recv(MTU)
                 if p is None:
                     break
                 if lfilter and not lfilter(p):
+                    # Possible filtering of the packet
                     continue
                 if store:
+                    # Add the packet to the list
                     lst.append(p)
                 if prn:
                     r = prn(p)
@@ -60,7 +66,6 @@ def sniff(store=False, prn=None, lfilter=None, stop_event=None, refresh=.1, *arg
     return plist.PacketList(lst, "Sniffed")
 
 
-# This class is intended to be used in interface neighbour lists
 class Neighbor:
     def __init__(self, router_id, ip_addr):
         self.router_id = router_id
@@ -68,9 +73,6 @@ class Neighbor:
 
 
 class Interface:
-    # Every instance starts with an empty list of neighbors
-    neighbors = []
-
     def __init__(self, ip_addr, subnet_mask, helloint, port):
         # The IP address of the interface
         # 32-bit
@@ -86,42 +88,72 @@ class Interface:
         self.helloint = helloint
 
         # The port number associated with this interface
+        # TODO - needed?
         self.port = port
 
+        # Every instance starts with an empty list of neighbors
+        self.neighbors = []
+
     def addNeighbor(self, neighbor_router_id, neighbor_ip):
+        # TODO - pass helloint and port number
         new_neighbor = Neighbor(neighbor_router_id, neighbor_ip)
         self.neighbors.append(new_neighbor)
 
 
-# TODO: I think cntrl is the router in which this thread is found
 class ARPManager(Thread):
     def __init__(self, cntrl):
         super(ARPManager, self).__init__()
         self.cntrl = cntrl
 
     def run(self):
-        # TODO: in pseudo code:
-        # while true
-        # consume ARP packet from some queue (probably one that belongs to the router controller)
-        # if packet is a request from data plane to create an ARP request:
-        # create as many ARP request packets as there are interfaces - 1
-        # pass them to back to data plane (probably to controller)
-        # if packet is an ARP request:
-        # if the ip in packet matches our own - create ARP reply and pass back (probably to controller)
-        # if it doesn't - do nothing (drop)
+        while True:
+            arp_packet = arp_in_queue.get()
+            # create the required arp request with possible dupes, not sure if control or data plane need to do this
+            # pass packets back to data plane (probably through control thread)
+            # if packet is an arp request:
+            # if the ip in packet matches our own - create ARP reply and pass back (probably to controller)
+            # if it doesn't - do nothing (drop)
         return
 
 
-# Naama - we're gonna treat this like a thread that has a list of interfaces
 class HelloManager(Thread):
     def __init__(self, cntrl, intf):
         super(HelloManager, self).__init__()
         self.cntrl = cntrl
+        # List of interfaces, TODO - maybe hashtable for performance?
         self.intf = intf
 
-    def run(self):
-        # TODO: Handle Hello packets
+    def sendHelloPackets(self):
+        # TODO - implement
         pass
+
+    def createHelloPacketSender(self):
+        self.sendHelloPackets()
+        # TODO - add start time
+        t = threading.Timer(0, self.createHelloPacketSender)
+        t.start()
+        return
+
+    def removeExpiredNeighbours(self):
+        # TODO - implement
+        pass
+
+    def createExpiredNeighbourRemover(self):
+        self.removeExpiredNeighbours()
+        # TODO - add start time
+        t = threading.Timer(0, self.createExpiredNeighbourRemover)
+        t.start()
+        return
+
+
+    def run(self):
+        while True:
+            self.createHelloPacketSender()
+            self.createExpiredNeighbourRemover()
+
+            hello_packet = hello_in_queue.get()
+            # TODO  - processing of packet
+        return
 
 
 # TODO: shouldn't this get a list of interfaces as well? or does it work based on existing
