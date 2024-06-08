@@ -176,10 +176,12 @@ control MyIngress(inout headers hdr,
     action bcast() {
         standard_metadata.egress_port = BROADCAST_PORT; // Broadcast port
     }
-
-    action ipv4_forward(ip4Addr_t next_hop, bit<9> port) {
+    
+    action ipv4_forward(macAddr_t next_hop, bit<9> port) {
         standard_metadata.egress_spec = port;
-        meta.next_hop_ip_add = next_hop;
+        hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
+        hdr.ethernet.dstAddr = dst_mac;
+        // meta.next_hop_ip_add = next_hop;
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
 
