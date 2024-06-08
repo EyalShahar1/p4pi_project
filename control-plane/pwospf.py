@@ -1,30 +1,28 @@
 import threading
 from select import select
-from scapy.all import conf, ETH_P_ALL, MTU, plist, Packet, Ether, IP, ARP
+from scapy.all import conf, ETH_P_ALL, MTU, plist, Packet, Ether, IP, ARP, sendp
 from scapy.packet import Packet, bind_layers
-from threading import Thread
-import queue
+from scapy.fields import ByteField, LenField, IntField, ShortField, LongField, IntEnumField, PacketListField
+from threading import Thread, Event
+import time
 
 ARP_OP_REPLY = 0x0002
 ARP_OP_REQ = 0x0001
 ARP_TIMEOUT = 30
 HELLO_TYPE = 0x01
-HELLO_TYPE = 0x01
 LSU_TYPE = 0x04
 OSPF_PROT_NUM = 0x59
 PWOSPF_HELLO_DEST = '224.0.0.5'
 TYPE_CPU_METADATA = 0x080a
+BROADCAST_MAC_ADDR = 'ff:ff:ff:ff:ff:ff'
 
-# Naama - can also be 0xffffffff
-INVALID_ROUTER_ID = 0
-
-# Global variables
-arp_in_queue = queue.Queue()
-arp_out_queue = queue.Queue()
-hello_in_queue = queue.Queue()
-hello_out_queue = queue.Queue()
-lsu_in_queue = queue.Queue()
-lsu_out_queue = queue.Queue()
+# NAAMA TODO - check if needed
+# NAAMA CHECK - can also be 0xffffffff
+# INVALID_ROUTER_ID = 0
+HELLOINT_IN_SECS = 10
+AREA_ID = 1
+VERSION_NUM = 2
+INVALID_SEQUENCE_NUM = 0
 
 # READ THIS FIRST
 # The way this works as far as I can understand - the router controller holds all the info of the router -
@@ -34,7 +32,7 @@ lsu_out_queue = queue.Queue()
 
 
 # This function "sniffs" for packets.
-# TODO - think if we want to open and close the socket, or write prn func to add the packet to some queue
+# TODO - think if we want to open and close the socket
 def sniff(store=False, prn=None, lfilter=None, stop_event=None, refresh=.1, *args, **kwargs):
     # Listen for packets
     s = conf.L2listen(type=ETH_P_ALL, *args, **kwargs)
@@ -84,100 +82,118 @@ class Interface:
 
         # Interval in seconds between HELLO messages
         # 16-bit
-        # TODO: maybe we assign all interfaces the same hard coded number
+        # NAAMA TODO: maybe we assign all interfaces the same hard coded number
         self.helloint = helloint
 
         # The port number associated with this interface
-        # TODO - needed?
+        # NAAMA TODO - needed?
         self.port = port
 
         # Every instance starts with an empty list of neighbors
         self.neighbors = []
 
     def addNeighbor(self, neighbor_router_id, neighbor_ip):
-        # TODO - pass helloint and port number
         new_neighbor = Neighbor(neighbor_router_id, neighbor_ip)
+        # Add neighbor to interface's neighbor list
         self.neighbors.append(new_neighbor)
+
+    def removeNeighbor(self):
+        # NAAMA TODO - function params? implement
+        pass
 
 
 class ARPManager(Thread):
-    def __init__(self, cntrl):
+    def __init__(self, cntrl, interface):
         super(ARPManager, self).__init__()
         self.cntrl = cntrl
+        # NAAMA TODO - not sure this is the way to do this, should I have arp manager per interface or just 1?
+        self.interface = interface
+
 
     def run(self):
         while True:
-            arp_packet = arp_in_queue.get()
-            # create the required arp request with possible dupes, not sure if control or data plane need to do this
-            # pass packets back to data plane (probably through control thread)
-            # if packet is an arp request:
-            # if the ip in packet matches our own - create ARP reply and pass back (probably to controller)
-            # if it doesn't - do nothing (drop)
-        return
+            # NAAMA TODO - not sure these 2 next lines works
+            pkt = self.ctrl.sniff_interface()
+            if ARP in pkt:
+                # Check if packet is an ARP request
+                if pkt[ARP].op == ARP_OP_REQ:
+                    # Check if the destination IP matches the interface's IP
+                    if pkt[IP].dst == self.interface.ip_addr:
+                        # Build ARP reply
+                        arp_reply_pkt = Ether(src = self.cntrl.MAC, dst = pkt[Ether].src) / ARP(
+                            op = ARP_OP_REPLY,
+                            hwsrc = self.cntrl.MAC,
+                            psrc = pkt[ARP].pdst,
+                            hwdst = pkt[ARP].hwsrc,
+                            pdst = pkt[ARP].psrc)
+                        # Send out ARP reply
+                        self.cntrl.send_pkt(arp_reply_pkt)
 
 
 class HelloManager(Thread):
-    def __init__(self, cntrl, intf):
+    def __init__(self, cntrl):
         super(HelloManager, self).__init__()
         self.cntrl = cntrl
-        # List of interfaces, TODO - maybe hashtable for performance?
-        self.intf = intf
-
-    def sendHelloPackets(self):
-        # TODO - implement
-        pass
-
-    def createHelloPacketSender(self):
-        self.sendHelloPackets()
-        # TODO - add start time
-        t = threading.Timer(0, self.createHelloPacketSender)
-        t.start()
-        return
-
-    def removeExpiredNeighbours(self):
-        # TODO - implement
-        pass
-
-    def createExpiredNeighbourRemover(self):
-        self.removeExpiredNeighbours()
-        # TODO - add start time
-        t = threading.Timer(0, self.createExpiredNeighbourRemover)
-        t.start()
-        return
+        self.interfaces = self.cntrl.interfaces
 
 
     def run(self):
         while True:
-            self.createHelloPacketSender()
-            self.createExpiredNeighbourRemover()
+            # Create HELLO packets
+            for interface in self.interfaces:
+                hello_pkt = Ether(src = self.cntrl.MAC,
+                                    dst = BROADCAST_MAC_ADDR) / IP(
+                                        src = interface.ip_addr,
+                                        dst = PWOSPF_HELLO_DEST
+                                        # NAAMA TODO - make sure this works
+                                    ) / PWOSPF(type = HELLO_TYPE) / Hello(
+                                        mask = interface.subnet_mask,
+                                        # NAAMA CHECK - maybe not needed
+                                        helloint = interface.helloint
+                                    )
+                self.cntrl.send_packet(hello_pkt)
+            # NAAMA TODO - maybe add constant time here, this is kinda akum
+            time.sleep(interface[0].helloint)
 
-            hello_packet = hello_in_queue.get()
-            # TODO  - processing of packet
-        return
 
-
-# TODO: shouldn't this get a list of interfaces as well? or does it work based on existing
-#  neighbours (probably the second option). lsuint should also probably a constant value
 class LSUManager(Thread):
     def __init__(self, cntrl, lsuint):
         super(LSUManager, self).__init__()
         self.lsuint = lsuint
         self.cntrl = cntrl
+        self.interfaces = self.cntrl.interfaces
+
+    # NAAMA TODO - needs to create a fiber that'll create and send LSU packets (the current content of the run
+    # func), and instead in the run func we need to handle LSU packets.
+    # This class will need to hold the adjency list and run djikstra
 
     def run(self):
-        return
-        # TODO: Handle LSU packets
+        while True:
+            for interface in self.interfaces:
+                for neighbor in interface.neighbors:
+                    # Create LSU packet
+                    lsu_pkt = Ether(src = self.cntrl.MAC,
+                                    dst = BROADCAST_MAC_ADDR) / IP(
+                                        src = interface.ip_addr,
+                                        dst = neighbor.ip_addr
+                                    ) / PWOSPF(type = LSU_TYPE) / LSU(
+                                        seq = self.cntrl.get_lsu_seq(),
+                                        ads = self.cntrl.get_lsu_ads()
+                                    )
+                    # Send LSU packet
+                    self.cntrl.send_pkt(lsu_pkt)
+            time.sleep(self.lsuint)
 
 
 # TODO - Router ID is by convention the IP address of the 0th interface of the router - we need to figure
 #  out to get that
 class RouterController(Thread):
 
-    def __init__(self, sw, routerID, MAC, areaID, intfs, lsuint=2, start_wait=0.3):
+    def __init__(self, sw, routerID, MAC, areaID, interfaces, lsuint=2, start_wait=0.3):
         # Calling the superclass constructor
         super(RouterController, self).__init__()
 
-        # TODO: no clue what this is
+        # NAAMA TODO: no clue what this is
         self.sw = sw
 
         # The router ID of the router
@@ -198,16 +214,46 @@ class RouterController(Thread):
         self.intfs = intfs
 
         # The interval in seconds between link state update broadcasts
-        # TODO: should this be hard coded?
+        # TODO: should this be hard coded? is the default in this func correct?
         self.lsuint = lsuint
 
         # TODO: what do we use this for?
         self.start_wait = start_wait
 
-    def run(self):
-        while True:
-            packet_list = sniff()
+        # NAAMA TODO - not sure this is needed
+        self.stop_event = Event()
 
+    lsu_seq = 0
+
+    def run(self):
+        # Start ARP manager for every interface
+        # NAAMA TODO - maybe in list comprehension create an array
+        for interface in self.interfaces:
+            arp_manager = ARPManager(self, interface)
+            arp_manager.start()
+        
+        # Start HELLO manager
+        hello_manager = HelloManager(self)
+        hello_manager.start()
+
+        # Start LSU manager
+        lsu_manager = LSUManager(self, self.lsuint)
+        lsu_manager.start()
+
+    def sniff_interface(self):
+        # NAAMA TODO - maybe we should store? and send to managers in queues?
+        return sniff(store = False, prn = None, stop_event = self.stop_event, refresh = 0.1)
+    
+    def send_pkt(self, pkt):
+        sendp(pkt, iface = self.sw)
+
+    def get_lsu_seq(self):
+        self.lsu_seq = self.lsu_seq + 1
+        return self.lsu_seq
+    
+    def get_lsu_ads(self):
+        # NAAMA TODO - implement
+        pass
 
 
 # TODO: not sure what this should contain
@@ -221,28 +267,53 @@ class CPUMetadata(Packet):
 class PWOSPF(Packet):
     name = "PWOSPF"
     fields_desc = [
-        # TODO: Create PWOSPF packet fields
+        ByteField("version", VERSION_NUM),
+        # TODO - made the default 0 so we won't misidentify packets, might need to change
+        ByteField("type", 0),
+        # TODO - this needs to include the length of the header, not just the payload
+        LenField("packet length", 0),
+        IntField("router ID", 0),
+        # TODO - add hard coded area ID
+        IntField("area ID", AREA_ID),
+        ShortField("checksum", 0),
+        ShortField("autype", 0),
+        LongField("authentication", 0)
     ]
 
 
-class Hello(Packet):
+class Hello(PWOSPF):
     name = "Hello"
     fields_desc = [
-        # TODO: Create Hello packet fields
+        # NAAMA TODO - might need to be 0xFFFFFFFF
+        # NAAMA TODO - maybe IPField?
+        IntField("network mask", '255.255.255.0'),
+        ShortField("HelloInt", HELLOINT_IN_SECS),
+        # NAAMA TODO - is this needed?
+        ShortField("padding", 0)
     ]
 
 
 class LSUad(Packet):
     name = "LSUad"
     fields_desc = [
-        # TODO: Create LSUad packet fields
+        # NAAMA TODO - maybe IPField? also make constant
+        IntField("subnet", '0.0.0.0'),
+        # NAAMA TODO - maybe IPField? also make constant
+        IntField("mask", '255.255.255.0'),
+        IntField("router ID", 0)
     ]
 
 
-class LSU(Packet):
+class LSU(PWOSPF):
     name = "LSU"
     fields_desc = [
-        # TODO: Create LSU packet fields
+        IntField("sequence", INVALID_SEQUENCE_NUM),
+        # NAAMA TODO - needed?
+        IntEnumField("TTL", 0),
+        LongField("advertisements", 0),
+        # NAAMA TODO - maybe fieldlistfield
+        PacketListField("LSUads", None, LSUad)
+        # option - FieldListField("ads", [], LSUad, count_from=lambda pkt: len(pkt.ads)
     ]
 
 
@@ -252,3 +323,8 @@ bind_layers(CPUMetadata, ARP, origEtherType=0x0806)
 bind_layers(IP, PWOSPF, proto=OSPF_PROT_NUM)
 bind_layers(PWOSPF, Hello, type=HELLO_TYPE)
 bind_layers(PWOSPF, LSU, type=LSU_TYPE)
+
+if __name__ == "__main__":
+    interfaces = []
+    router_controller = RouterController("eth0", "", "", AREA_ID, interfaces)
+    router_controller.start()
