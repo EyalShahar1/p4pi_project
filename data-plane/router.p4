@@ -215,7 +215,7 @@ control MyIngress(inout headers hdr,
     }
 
     // Next hop IP address -> destination MAC address
-    table arp_table {
+    table forwarding_table {
         key = {meta.next_hop_ip_add: exact;}
 
         actions = {

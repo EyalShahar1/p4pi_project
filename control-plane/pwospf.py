@@ -4,7 +4,10 @@ from scapy.all import conf, ETH_P_ALL, MTU, plist, Packet, Ether, IP, ARP, sendp
 from scapy.packet import Packet, bind_layers
 from scapy.fields import ByteField, LenField, IntField, ShortField, LongField, IntEnumField, PacketListField
 from threading import Thread, Event
+from queue import Queue
 import time
+
+import p4runtime_lib.switch
 
 ARP_OP_REPLY = 0x0002
 ARP_OP_REQ = 0x0001
@@ -16,23 +19,15 @@ PWOSPF_HELLO_DEST = '224.0.0.5'
 TYPE_CPU_METADATA = 0x080a
 BROADCAST_MAC_ADDR = 'ff:ff:ff:ff:ff:ff'
 
-# NAAMA TODO - check if needed
-# NAAMA CHECK - can also be 0xffffffff
-# INVALID_ROUTER_ID = 0
+INVALID_ROUTER_ID = 0
 HELLOINT_IN_SECS = 10
+# For simplicity, we defined the entire network as one area with the same area ID
 AREA_ID = 1
 VERSION_NUM = 2
 INVALID_SEQUENCE_NUM = 0
 
-# READ THIS FIRST
-# The way this works as far as I can understand - the router controller holds all the info of the router -
-# the tables and everything - and it's a thread. It holds an ARP manager (thread) that it forwards all ARP packets
-# to, a HELLO manager (thread) that creates all HELLO packets and manages incoming one,
-# and an LSU manager (thread) that creates all LSA packets.
-
 
 # This function "sniffs" for packets.
-# TODO - think if we want to open and close the socket
 def sniff(store=False, prn=None, lfilter=None, stop_event=None, refresh=.1, *args, **kwargs):
     # Listen for packets
     s = conf.L2listen(type=ETH_P_ALL, *args, **kwargs)
@@ -64,12 +59,17 @@ def sniff(store=False, prn=None, lfilter=None, stop_event=None, refresh=.1, *arg
     return plist.PacketList(lst, "Sniffed")
 
 
+# This class defines a neighbor, which is in reality an interface of another router. The neighbor is defined by an IP
+# address (of the interface) and a router ID (of the router this interface belongs to)
 class Neighbor:
     def __init__(self, router_id, ip_addr):
         self.router_id = router_id
         self.ip_addr = ip_addr
 
 
+# This class defines an interface, which is an abstract entity that defines the conenction between a router and one of
+# its links. The interface is defined by its IP address, its subnet mask, the interval for sending out HELLO packets to
+# all its neighbors (which in actuality is constant for the entire network), and its port number.
 class Interface:
     def __init__(self, ip_addr, subnet_mask, helloint, port):
         # The IP address of the interface
@@ -82,11 +82,9 @@ class Interface:
 
         # Interval in seconds between HELLO messages
         # 16-bit
-        # NAAMA TODO: maybe we assign all interfaces the same hard coded number
         self.helloint = helloint
 
         # The port number associated with this interface
-        # NAAMA TODO - needed?
         self.port = port
 
         # Every instance starts with an empty list of neighbors
@@ -102,58 +100,105 @@ class Interface:
         pass
 
 
+# This class defines a thread that handles incoming ARP packets
 class ARPManager(Thread):
-    def __init__(self, cntrl, interface):
+    def __init__(self, cntrl):
         super(ARPManager, self).__init__()
         self.cntrl = cntrl
-        # NAAMA TODO - not sure this is the way to do this, should I have arp manager per interface or just 1?
-        self.interface = interface
+        self.pkt_queue = Queue()
+
+
+    def add_forwarding_entry(self, dst_ip_addr, dst_mac_addr, egress_port):
+        # Create the table entry
+        table_entry = p4runtime_lib.helper.P4InfoHelper.buildTableEntry(
+            table_name = "MyIngress.forwarding_table",
+            match_fields = {"meta.next_hop_ip_add": (dst_ip_addr, 32)},
+            action_name = "MyIngress.ipv4_forward",
+            action_params = {
+                "next_hop": dst_mac_addr,
+                "port": egress_port
+                }
+        )
+
+        # Write entry to table
+        p4runtime_lib.switch.SwitchConnection.WriteTableEntry(table_entry)
 
 
     def run(self):
         while True:
-            # NAAMA TODO - not sure these 2 next lines works
-            pkt = self.ctrl.sniff_interface()
-            if ARP in pkt:
-                # Check if packet is an ARP request
-                if pkt[ARP].op == ARP_OP_REQ:
-                    # Check if the destination IP matches the interface's IP
-                    if pkt[IP].dst == self.interface.ip_addr:
-                        # Build ARP reply
-                        arp_reply_pkt = Ether(src = self.cntrl.MAC, dst = pkt[Ether].src) / ARP(
-                            op = ARP_OP_REPLY,
-                            hwsrc = self.cntrl.MAC,
-                            psrc = pkt[ARP].pdst,
-                            hwdst = pkt[ARP].hwsrc,
-                            pdst = pkt[ARP].psrc)
-                        # Send out ARP reply
-                        self.cntrl.send_pkt(arp_reply_pkt)
+            # Consume packets from queue
+            pkt = self.pkt_queue.get()
+
+            # Check if packet is an ARP request
+            if pkt[ARP].op == ARP_OP_REQ:
+
+                # Check if the destination IP matches the interface's IP
+                if pkt[IP].dst == self.interface.ip_addr:
+
+                    # Build ARP reply
+                    arp_reply_pkt = Ether(src = self.cntrl.MAC, dst = pkt[Ether].src) / ARP(
+                        op = ARP_OP_REPLY,
+                        hwsrc = self.cntrl.MAC,
+                        psrc = pkt[ARP].pdst,
+                        hwdst = pkt[ARP].hwsrc,
+                        pdst = pkt[ARP].psrc)
+                        
+                    # Send out ARP reply
+                    self.cntrl.send_pkt(arp_reply_pkt)
+
+            # Check if packet is an ARP request
+            # NAAMA TODO - I assume here that the dst MAC was checked in data plane and this is addressed to me
+            elif pkt[ARP].op == ARP_OP_REPLY:
+
+                # Add the new information to the forwarding table
+                self.add_forwarding_entry(
+                    dst_ip_addr = pkt[ARP].psrc,
+                    dst_mac_addr = pkt[ARP].hwsrc,
+                    egress_port = pkt[CPUMetadata].ingressPort
+                )
 
 
+class HelloPacketSender(Thread):
+    def __init__(self, cntrl, helloint):
+        super(HelloPacketSender, self).__init__()
+        self.cntrl = cntrl
+        self.interfaces = self.cntrl.interfaces
+        self.helloint = helloint
+
+    
+    def run(self):
+        while True:
+            for interface in interfaces:
+                hello_pkt = Ether(src = self.cntrl.MAC,
+                                  dst = BROADCAST_MAC_ADDR) / IP(
+                                      src = interface.ip_addr,
+                                      dst = PWOSPF_HELLO_DEST
+                                      ) / PWOSPF(type = HELLO_TYPE) / Hello(
+                                          mask = interface.subnet_mask,
+                                          # NAAMA CHECK - might not be needed
+                                          helloint = interface.helloint
+                                          )
+                self.cntrl.send_packet(hello_pkt)
+
+            time.sleep(self.helloint)
+            
+
+
+# This class defines a thread that handles sending out periodic HELLO packets and updating neighbors 
 class HelloManager(Thread):
     def __init__(self, cntrl):
         super(HelloManager, self).__init__()
         self.cntrl = cntrl
-        self.interfaces = self.cntrl.interfaces
+        self.pkt_queue = Queue()
 
 
     def run(self):
+        hello_pkt_sender = HelloPacketSender(self.cntrl, HELLOINT_IN_SECS)
+        hello_pkt_sender.start()
+
+
         while True:
-            # Create HELLO packets
-            for interface in self.interfaces:
-                hello_pkt = Ether(src = self.cntrl.MAC,
-                                    dst = BROADCAST_MAC_ADDR) / IP(
-                                        src = interface.ip_addr,
-                                        dst = PWOSPF_HELLO_DEST
-                                        # NAAMA TODO - make sure this works
-                                    ) / PWOSPF(type = HELLO_TYPE) / Hello(
-                                        mask = interface.subnet_mask,
-                                        # NAAMA CHECK - maybe not needed
-                                        helloint = interface.helloint
-                                    )
-                self.cntrl.send_packet(hello_pkt)
-            # NAAMA TODO - maybe add constant time here, this is kinda akum
-            time.sleep(interface[0].helloint)
+            pass
 
 
 class LSUManager(Thread):
@@ -162,6 +207,7 @@ class LSUManager(Thread):
         self.lsuint = lsuint
         self.cntrl = cntrl
         self.interfaces = self.cntrl.interfaces
+        self.pkt_queue = Queue()
 
     # NAAMA TODO - needs to create a fiber that'll create and send LSU packets (the current content of the run
     # func), and instead in the run func we need to handle LSU packets.
@@ -211,7 +257,7 @@ class RouterController(Thread):
         self.areaID = areaID
 
         # List of router interfaces
-        self.intfs = intfs
+        self.intfs = interfaces
 
         # The interval in seconds between link state update broadcasts
         # TODO: should this be hard coded? is the default in this func correct?
@@ -223,44 +269,66 @@ class RouterController(Thread):
         # NAAMA TODO - not sure this is needed
         self.stop_event = Event()
 
+        self.arp_manager = None
+        self.hello_manager = None
+        self.lsu_manager = None
+
     lsu_seq = 0
 
-    def run(self):
-        # Start ARP manager for every interface
-        # NAAMA TODO - maybe in list comprehension create an array
-        for interface in self.interfaces:
-            arp_manager = ARPManager(self, interface)
-            arp_manager.start()
-        
-        # Start HELLO manager
-        hello_manager = HelloManager(self)
-        hello_manager.start()
 
-        # Start LSU manager
-        lsu_manager = LSUManager(self, self.lsuint)
-        lsu_manager.start()
+    def process_pkt(self, pkt):
+        if ARP in pkt:
+            self.arp_manager.pkt_queue.put(pkt)
+        elif Hello in pkt:
+            self.hello_manager.pkt_queue.put(pkt)
+        elif LSU in pkt:
+            self.lsu_manager.pkt_queue.put(pkt)
+
 
     def sniff_interface(self):
-        # NAAMA TODO - maybe we should store? and send to managers in queues?
-        return sniff(store = False, prn = None, stop_event = self.stop_event, refresh = 0.1)
+        return sniff(store = False, prn = self.process_pkt, stop_event = self.stop_event, refresh = 0.1)
     
+
     def send_pkt(self, pkt):
         sendp(pkt, iface = self.sw)
+
 
     def get_lsu_seq(self):
         self.lsu_seq = self.lsu_seq + 1
         return self.lsu_seq
     
+
     def get_lsu_ads(self):
         # NAAMA TODO - implement
         pass
+
+
+    def run(self):
+        # Start ARP manager
+        arp_manager = ARPManager(self)
+        arp_manager.start()
+        self.arp_manager = arp_manager
+
+        # Start HELLO manager
+        hello_manager = HelloManager(self)
+        hello_manager.start()
+        self.hello_manager = hello_manager
+
+        # Start LSU manager
+        lsu_manager = LSUManager(self, self.lsuint)
+        lsu_manager.start()
+        self.lsu_manager = lsu_manager
+
+        self.sniff_interface()
+
+        
 
 
 # TODO: not sure what this should contain
 class CPUMetadata(Packet):
     name = "CPUMetadata"
     fields_desc = [
-        # TODO: Create CPUMetadata packet fields
+        # TODO: Create CPUMetadata packet fields - I know I need ingress
     ]
 
 
