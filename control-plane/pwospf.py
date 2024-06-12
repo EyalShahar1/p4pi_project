@@ -21,6 +21,9 @@ BROADCAST_MAC_ADDR = 'ff:ff:ff:ff:ff:ff'
 
 INVALID_ROUTER_ID = 0
 HELLOINT_IN_SECS = 10
+INITIAL_HELLOINT = 3 * HELLOINT_IN_SECS
+LSUINT_IN_SECS = 30
+INITIAL_LSUINT = 3 * LSUINT_IN_SECS
 # For simplicity, we defined the entire network as one area with the same area ID
 AREA_ID = 1
 VERSION_NUM = 2
@@ -65,6 +68,7 @@ class Neighbor:
     def __init__(self, router_id, ip_addr):
         self.router_id = router_id
         self.ip_addr = ip_addr
+        self.uptime_counter = AtomicCounter(initial = INITIAL_HELLOINT)
 
 
 # This class defines an interface, which is an abstract entity that defines the conenction between a router and one of
@@ -88,16 +92,18 @@ class Interface:
         self.port = port
 
         # Every instance starts with an empty list of neighbors
-        self.neighbors = []
+        self.neighbors = {}
 
-    def addNeighbor(self, neighbor_router_id, neighbor_ip):
+    def add_neighbor(self, neighbor_router_id, neighbor_ip):
         new_neighbor = Neighbor(neighbor_router_id, neighbor_ip)
         # Add neighbor to interface's neighbor list
-        self.neighbors.append(new_neighbor)
+        self.neighbors[neighbor_ip] = new_neighbor
 
-    def removeNeighbor(self):
-        # NAAMA TODO - function params? implement
-        pass
+    # NAAMA TODO - decide if I need to lock this list
+    def remove_neighbor(self, neighbor_ip):
+        del self.neighbors[neighbor_ip]
+
+
 
 
 # This class defines a thread that handles incoming ARP packets
@@ -133,20 +139,20 @@ class ARPManager(Thread):
             if pkt[ARP].op == ARP_OP_REQ:
 
                 # Check if the destination IP matches the interface's IP
-                if pkt[IP].dst == self.interface.ip_addr:
-
-                    # Build ARP reply
-                    arp_reply_pkt = Ether(src = self.cntrl.MAC, dst = pkt[Ether].src) / ARP(
-                        op = ARP_OP_REPLY,
-                        hwsrc = self.cntrl.MAC,
-                        psrc = pkt[ARP].pdst,
-                        hwdst = pkt[ARP].hwsrc,
-                        pdst = pkt[ARP].psrc)
+                for interface in self.cntrl.interfaces:
+                    if pkt[IP].dst == interface.ip_addr:
+                        # Build ARP reply
+                        arp_reply_pkt = Ether(src = self.cntrl.MAC, dst = pkt[Ether].src) / ARP(
+                            op = ARP_OP_REPLY,
+                            hwsrc = self.cntrl.MAC,
+                            psrc = pkt[ARP].pdst,
+                            hwdst = pkt[ARP].hwsrc,
+                            pdst = pkt[ARP].psrc)
                         
-                    # Send out ARP reply
-                    self.cntrl.send_pkt(arp_reply_pkt)
+                        # Send out ARP reply
+                        self.cntrl.send_pkt(arp_reply_pkt)
 
-            # Check if packet is an ARP request
+            # Check if packet is an ARP reply
             # NAAMA TODO - I assume here that the dst MAC was checked in data plane and this is addressed to me
             elif pkt[ARP].op == ARP_OP_REPLY:
 
@@ -162,13 +168,12 @@ class HelloPacketSender(Thread):
     def __init__(self, cntrl, helloint):
         super(HelloPacketSender, self).__init__()
         self.cntrl = cntrl
-        self.interfaces = self.cntrl.interfaces
         self.helloint = helloint
 
     
     def run(self):
         while True:
-            for interface in interfaces:
+            for interface in self.cntrl.interfaces:
                 hello_pkt = Ether(src = self.cntrl.MAC,
                                   dst = BROADCAST_MAC_ADDR) / IP(
                                       src = interface.ip_addr,
@@ -181,6 +186,12 @@ class HelloPacketSender(Thread):
                 self.cntrl.send_packet(hello_pkt)
 
             time.sleep(self.helloint)
+
+            for interface in self.cntrl.interfaces:
+                for neighbor in interface.neighbors.values():
+                    new_uptime_value = neighbor.uptime_counter.decrement(HELLOINT_IN_SECS)
+                    if new_uptime_value <= 0:
+                        interface.remove_neighbor(neighbor.ip_addr)
             
 
 
@@ -198,7 +209,56 @@ class HelloManager(Thread):
 
 
         while True:
-            pass
+            # Consume packets from queue
+            pkt = self.pkt_queue.get()
+
+            for interface in self.cntrl.interfaces:
+                # Find the ingress interface using the ingress port
+                if interface.port == pkt[CPUMetadata].ingressPort:
+                    # Check if the interface already knows this neighbor
+                    neighbor = interface.neighbors.get(pkt[IP].src)
+                    if neighbor is not None:
+                        neighbor.uptime_counter.set_value(INITIAL_HELLOINT)
+
+                    else:
+                        # If neighbor not found, add it
+                        interface.add_neighbor(pkt[PWOSPF]["router ID"], pkt[IP].src)
+                    
+                    break
+
+
+class LsuPacketSender(Thread):
+    def __init__(self, cntrl, lsuint):
+        super(LsuPacketSender, self).__init__()
+        self.cntrl = cntrl
+        self.lsuint = lsuint
+
+    def run(self):
+        while True:
+            for interface in self.cntrl.interfaces:
+                # Create LSU packet
+                lsu_pkt = Ether(src = self.cntrl.MAC,
+                                dst = BROADCAST_MAC_ADDR) / IP(
+                                src = interface.ip_addr,
+                                dst = PWOSPF_HELLO_DEST
+                                ) / PWOSPF(type = LSU_TYPE) / LSU(
+                                    seq = self.cntrl.lsu_counter.get_value(),
+                                    ads = self.cntrl.get_lsu_ads()
+                                    )
+                # Send LSU packet
+                self.cntrl.send_pkt(lsu_pkt)
+
+            time.sleep(self.lsuint)
+
+
+class TopologyNeighbor():
+    def __init__(self, router_id, subnet, mask):
+        self.router_id = router_id
+        self.subnet = subnet
+        self.mask = mask
+        self.seq_num = INVALID_SEQUENCE_NUM
+        self.lsu_counter = AtomicCounter(initial = INITIAL_LSUINT)
+        self.neighbors = {}
 
 
 class LSUManager(Thread):
@@ -206,29 +266,62 @@ class LSUManager(Thread):
         super(LSUManager, self).__init__()
         self.lsuint = lsuint
         self.cntrl = cntrl
-        self.interfaces = self.cntrl.interfaces
         self.pkt_queue = Queue()
 
-    # NAAMA TODO - needs to create a fiber that'll create and send LSU packets (the current content of the run
-    # func), and instead in the run func we need to handle LSU packets.
-    # This class will need to hold the adjency list and run djikstra
+        # An adjency list - a dictionary of Topology routers (with the key being the router ID), each holding a list
+        # of topology router neighbors (meaning their router ID)
+        # NAAMA TODO - how to initially fill this?
+        self.topology = {}
 
     def run(self):
+        lsu_pkt_sender = LsuPacketSender(self.cntrl, self.lsuint)
+        lsu_pkt_sender.start()
+
         while True:
-            for interface in self.interfaces:
-                for neighbor in interface.neighbors:
-                    # Create LSU packet
-                    lsu_pkt = Ether(src = self.cntrl.MAC,
-                                    dst = BROADCAST_MAC_ADDR) / IP(
-                                        src = interface.ip_addr,
-                                        dst = neighbor.ip_addr
-                                    ) / PWOSPF(type = LSU_TYPE) / LSU(
-                                        seq = self.cntrl.get_lsu_seq(),
-                                        ads = self.cntrl.get_lsu_ads()
-                                    )
-                    # Send LSU packet
-                    self.cntrl.send_pkt(lsu_pkt)
-            time.sleep(self.lsuint)
+            # Consume packets from queue
+            pkt = self.pkt_queue.get()
+
+            src_router_id = pkt[PWOSPF]["Router ID"]
+
+            if src_router_id == self.cntrl.routerID:
+                continue
+            
+            src_router_adjency_list = self.topology.get(src_router_id)
+
+            if src_router_adjency_list is None:
+                src_router_adjency_list = []
+
+            curr_seq_num = pkt[LSU].sequence
+
+            if src_router_adjency_list[0].seq_num == curr_seq_num:
+                continue
+
+
+
+
+class AtomicCounter:
+    def __init__(self, initial=0):
+        self.value = initial
+        self.lock = threading.Lock()
+
+    def increment(self, amount = 1):
+        with self.lock:
+            self.value += amount
+            return self.value
+        
+    def decrement(self, amount = 1):
+        with self.lock:
+            self.value -= amount
+            return self.value
+        
+    def get_value(self):
+        with self.lock:
+            return self.value
+        
+    def set_value(self, new_value):
+        with self.lock:
+            self.value = new_value
+            return self.value
 
 
 # TODO - Router ID is by convention the IP address of the 0th interface of the router - we need to figure
@@ -273,7 +366,7 @@ class RouterController(Thread):
         self.hello_manager = None
         self.lsu_manager = None
 
-    lsu_seq = 0
+        self.lsu_counter = AtomicCounter()
 
 
     def process_pkt(self, pkt):
@@ -319,6 +412,7 @@ class RouterController(Thread):
         lsu_manager.start()
         self.lsu_manager = lsu_manager
 
+        # NAAMA TODO - need to sniff all interfaces
         self.sniff_interface()
 
         
@@ -328,7 +422,7 @@ class RouterController(Thread):
 class CPUMetadata(Packet):
     name = "CPUMetadata"
     fields_desc = [
-        # TODO: Create CPUMetadata packet fields - I know I need ingress
+        ShortField("ingressPort", 0)
     ]
 
 
