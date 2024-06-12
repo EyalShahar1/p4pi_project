@@ -177,11 +177,13 @@ control MyIngress(inout headers hdr,
         standard_metadata.egress_port = BROADCAST_PORT; // Broadcast port
     }
     
-    action ipv4_forward(macAddr_t next_hop, bit<9> port) {
+    // this action changes our next hop based on the data from the routing table
+    // the next hop address will determine the destination MAC address
+    action ipv4_forward(ip4Addr_t next_hop, port_t port) {
         standard_metadata.egress_spec = port;
-        hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
-        hdr.ethernet.dstAddr = dst_mac;
-        // meta.next_hop_ip_add = next_hop;
+        // hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
+        // hdr.ethernet.dstAddr = dst_mac;
+        meta.next_hop_ip_add = next_hop;
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
 
@@ -203,7 +205,7 @@ control MyIngress(inout headers hdr,
 
     // Destination IP address -> next hop IP address, output port
     table routing_table {
-        key = {hdr.arp.dst_ip: lpm; }
+        key = {hdr.ipv4.dst_ip: lpm; }
 
         actions = {
             ipv4_forward;
@@ -252,10 +254,30 @@ control MyIngress(inout headers hdr,
     }
 }
 
+// Egress control used to determine the output port and mac address
 control MyEgress(inout headers hdr,
                  inout metadata meta,
                  inout standard_metadata_t standard_metadata) {
-    apply { }
+    action set_dst_and_src_mac(macAddr_t dst_mac) {
+        hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
+        hdr.ethernet.dstAddr = dst_mac;
+    }
+
+    // this table entries may be populated using arp protocol implementation
+    table forward_table {
+        key = {meta.next_hop_ip_add: exact; }
+
+        actions = {
+            set_dst_and_src_mac;
+            drop;
+            no_action;            
+        }
+        size = 256;
+        default_action = no_action();
+    }    
+    apply {        
+        forward_table.apply();
+     }
 }
 
 control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
