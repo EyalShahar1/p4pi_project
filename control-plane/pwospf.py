@@ -6,7 +6,9 @@ from scapy.fields import ByteField, LenField, IntField, ShortField, LongField, I
 from threading import Thread, Event
 from queue import Queue
 import time
+import heapq
 
+import p4runtime_lib.helper
 import p4runtime_lib.switch
 
 ARP_OP_REPLY = 0x0002
@@ -23,7 +25,7 @@ INVALID_ROUTER_ID = 0
 HELLOINT_IN_SECS = 10
 INITIAL_HELLOINT = 3 * HELLOINT_IN_SECS
 LSUINT_IN_SECS = 30
-INITIAL_LSUINT = 3 * LSUINT_IN_SECS
+LSU_TIMEOUT = 3 * LSUINT_IN_SECS
 # For simplicity, we defined the entire network as one area with the same area ID
 AREA_ID = 1
 VERSION_NUM = 2
@@ -102,8 +104,6 @@ class Interface:
     # NAAMA TODO - decide if I need to lock this list
     def remove_neighbor(self, neighbor_ip):
         del self.neighbors[neighbor_ip]
-
-
 
 
 # This class defines a thread that handles incoming ARP packets
@@ -194,7 +194,6 @@ class HelloPacketSender(Thread):
                         interface.remove_neighbor(neighbor.ip_addr)
             
 
-
 # This class defines a thread that handles sending out periodic HELLO packets and updating neighbors 
 class HelloManager(Thread):
     def __init__(self, cntrl):
@@ -251,15 +250,20 @@ class LsuPacketSender(Thread):
             time.sleep(self.lsuint)
 
 
+class TopologyRouter():
+    def __init__(self, router_id):
+        self.router_id = router_id
+        self.seq_num = INVALID_SEQUENCE_NUM
+        self.lsu_counter = time.time()
+        self.neighbors = {}
+
+
 class TopologyNeighbor():
     def __init__(self, router_id, subnet, mask):
         self.router_id = router_id
         self.subnet = subnet
         self.mask = mask
-        self.seq_num = INVALID_SEQUENCE_NUM
-        self.lsu_counter = AtomicCounter(initial = INITIAL_LSUINT)
-        self.neighbors = {}
-
+        
 
 class LSUManager(Thread):
     def __init__(self, cntrl, lsuint):
@@ -268,10 +272,52 @@ class LSUManager(Thread):
         self.cntrl = cntrl
         self.pkt_queue = Queue()
 
-        # An adjency list - a dictionary of Topology routers (with the key being the router ID), each holding a list
-        # of topology router neighbors (meaning their router ID)
+        # An adjency list - a dictionary of Topology routers (with the key being the router ID), each holding a
+        # dictionary of topology router neighbors (meaning their router ID)
         # NAAMA TODO - how to initially fill this?
         self.topology = {}
+
+    def run_djikstra(self):
+        unvisited_neighbors = {self.topology.keys()}
+        predecessors = {key : None for key in self.topology.keys()}
+
+        distances = {key : float('inf') for key in self.topology.keys()}
+        distances[self.cntrl.router_id] = 0
+        
+        # NAAMA CHECK - I'm unsure about the way this heap works
+        neighbors_heap = [(self.topology[key], key) for key in self.topology.keys()]
+        heapq.heapify(neighbors_heap)
+
+        while neighbors_heap:
+            current_distance, current_router = heapq.heappop(neighbors_heap)
+            unvisited_neighbors.remove(current_router)
+
+            for neighbor in current_router.neighbors:
+                if neighbor.router_id not in unvisited_neighbors:
+                    continue
+
+                neighbor_distance = distances[neighbor.router_id]
+
+                if current_distance + 1 < neighbor_distance:
+                    distances[neighbor.router_id] = current_distance + 1
+                    # NAAMA TODO - make sure I don't get duplicates
+                    heapq.heappush(neighbors_heap, (current_distance + 1, neighbor.router_id))
+                    predecessors[neighbor.router_id] = current_router
+
+        return predecessors
+    
+    def fill_routing_table(self, predecessors):
+        for router_id in predecessors:
+            # Create the table entry
+            table_entry = p4runtime_lib.helper.P4InfoHelper.buildTableEntry(
+                table_name = "MyIngress.routing_talbe",
+                match_fields = {"hdr.arp.dst_ip": ()},
+                action_name = "",
+                action_params = {}
+            )
+
+            # Write entry to table
+            p4runtime_lib.switch.SwitchConnection.WriteTableEntry(table_entry)
 
     def run(self):
         lsu_pkt_sender = LsuPacketSender(self.cntrl, self.lsuint)
@@ -280,42 +326,60 @@ class LSUManager(Thread):
         while True:
             # Consume packets from queue
             pkt = self.pkt_queue.get()
+            should_run_djikstra = False
 
             src_router_id = pkt[PWOSPF]["Router ID"]
 
             if src_router_id == self.cntrl.routerID:
                 continue
             
-            src_router_adjency_list = self.topology.get(src_router_id)
+            src_router = self.topology.get(src_router_id)
 
-            if src_router_adjency_list is None:
-                src_router_adjency_list = []
+            if src_router is None:
+                src_router = TopologyNeighbor(src_router_id)
+                should_run_djikstra = True
 
             curr_seq_num = pkt[LSU].sequence
 
-            if src_router_adjency_list[0].seq_num == curr_seq_num:
+            if curr_seq_num == src_router.seq_num:
                 continue
 
+            found_neighbors_ids = set()
 
+            # NAAMA TODO - check for each packet that there's no conflict
+            for LSUad in pkt[LSU].LSUads:
+                topology_neighbor = src_router.neighbors.get(LSUad["router ID"])
+                if topology_neighbor is None:
+                    src_router.neighbors[LSUad["router ID"]] = TopologyNeighbor(LSUad["router ID"],
+                                                                                LSUad["subnet"],
+                                                                                LSUad["mask"])
+                    should_run_djikstra = True
+
+                found_neighbors_ids.add(LSUad["router ID"])
+                    
+            for neighbor in src_router.neighbors.values():
+                if neighbor.router_id in found_neighbors_ids:
+                    neighbor.lsu_counter = time.time()
+                else:
+                    if time.time() - neighbor.lsu_counter > LSU_TIMEOUT:
+                        del src_router.neighbors[neighbor]
+                        should_run_djikstra = True
+
+            if should_run_djikstra:
+                predecessors = self.run_djikstra()
+                self.fill_routing_table(predecessors)
+
+            # NAAMA TODO - might need to flood this packet
 
 
 class AtomicCounter:
     def __init__(self, initial=0):
         self.value = initial
         self.lock = threading.Lock()
-
-    def increment(self, amount = 1):
-        with self.lock:
-            self.value += amount
-            return self.value
         
     def decrement(self, amount = 1):
         with self.lock:
             self.value -= amount
-            return self.value
-        
-    def get_value(self):
-        with self.lock:
             return self.value
         
     def set_value(self, new_value):
@@ -366,8 +430,6 @@ class RouterController(Thread):
         self.hello_manager = None
         self.lsu_manager = None
 
-        self.lsu_counter = AtomicCounter()
-
 
     def process_pkt(self, pkt):
         if ARP in pkt:
@@ -416,8 +478,6 @@ class RouterController(Thread):
         self.sniff_interface()
 
         
-
-
 # TODO: not sure what this should contain
 class CPUMetadata(Packet):
     name = "CPUMetadata"
