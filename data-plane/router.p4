@@ -246,7 +246,7 @@ control MyIngress(inout headers hdr,
         // If packet is not from CPU and not ARP/OSPF - apply routing
         routing_table.apply();
         // might need to apply arp table if arp
-        arp_table.apply();
+        // arp_table.apply();
     }
 }
 

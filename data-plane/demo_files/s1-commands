@@ -1,0 +1,11 @@
+table_set_default MyIngress.routing_table MyIngress.drop
+table_set_default MyEgress.forwarding_table MyEgress.drop
+
+table_add MyIngress.routing_table MyIngress.ipv4_forward 10.0.10.0/24 => 10.0.10.10    1
+table_add MyIngress.routing_table MyIngress.ipv4_forward 10.0.20.0/24 => 192.168.3.1   2
+table_add MyIngress.routing_table MyIngress.ipv4_forward 10.0.30.0/24 => 192.168.1.254 3
+
+table_add MyEgress.forwarding_table MyEgress.set_dst_and_src_mac 10.0.10.10 => 00:00:00:00:00:01
+table_add MyEgress.forwarding_table MyEgress.set_dst_and_src_mac 192.168.3.1 => 00:00:00:00:02:02
+table_add MyEgress.forwarding_table MyEgress.set_dst_and_src_mac 192.168.1.254 => 00:00:00:00:03:03
+
