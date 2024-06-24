@@ -1,3 +1,6 @@
+# TODO - gateway router
+# TODO - how to check for conflicting LSU? we're bound to get the LSUs one after the other
+
 ###############################
 #---------- Imports ----------#
 ###############################
@@ -86,6 +89,12 @@ INVALID_SEQUENCE_NUM = 0
 # PWOSPF protocol version number
 VERSION_NUM = 2
 
+# Invalid router ID
+INVALID_ROUTER_ID = 0
+
+# The constant and unused authentication type for all network routers and packets
+AUTHENTICATION_TYPE = 0
+
 
 ########################################
 #---------- Sniff() function ----------#
@@ -140,6 +149,15 @@ class Neighbor:
         # A counter for the uptime of the neighbor - it will be removed if it reaches 0
         self.uptime_counter = AtomicCounter(initial = INITIAL_HELLOINT)
 
+        # The sequence number of the last LSU received from this neighbor
+        self.lsu_seq_num = INVALID_SEQUENCE_NUM
+
+        # A counter to track how long it's been since the last LSU packet from this neighbor
+        self.lsu_counter = time()
+
+        # A dictionary of neighbors for this router
+        self.neighbors = {}
+
 
 # This class defines an interface, which is an abstract entity that defines the connection between a router and one of
 # its links. The interface is defined by its IP address, its subnet mask, the interval for sending out HELLO packets to
@@ -158,7 +176,8 @@ class Interface:
         # The port number associated with this interface
         self.port = port
 
-        # A dictionary of neighbors. Every instance starts with an empty dictionary.
+        # A dictionary of neighbors. Every instance starts with an empty dictionary. The key is the IP of the neighbor,
+        # and the value is a Neighbor instance.
         # TODO - decide if I need to lock this dictionary
         self.neighbors = {}
 
@@ -171,37 +190,6 @@ class Interface:
     def remove_neighbor(self, neighbor_ip):
         # Remove the neighbor 
         del self.neighbors[neighbor_ip]
-
-
-# This class defines a topology router entity, which is essentially an PWOSPF router. The topology router is defined by
-# a unique router ID, and the sequence number of the last LSU packet that arrived from this router.
-class TopologyRouter():
-    def __init__(self, router_id, seq_num):
-        # The router ID of this router
-        self.router_id = router_id
-
-        # The sequence number of the last LSU packet sent from this router
-        self.seq_num = seq_num
-
-        # A counter to track how long it's been since the last LSU packet from this host.
-        self.lsu_counter = time()
-
-        # A dictionary of neighbors for this router
-        self.neighbors = {}
-
-
-# This class defines a topology neighbor entity. It is defined by its router ID, the subnet mask of the link it
-# describes, and the subnet mask of the link it describes.
-class TopologyNeighbor():
-    def __init__(self, router_id, subnet, mask):
-        # The router ID of this neighbor
-        self.router_id = router_id
-
-        # The subnet of the link between this neighbor and the router it's the neighbor of
-        self.subnet = subnet
-
-        # The mask of the subnet between this neighbor and the router it's the neighbor of
-        self.mask = mask
 
 
 # This class defines a locked counter that can be safely accessed from multiple threads
@@ -302,7 +290,7 @@ class ARPManager(Thread):
 
 # This class defines a thread that periodically sends out HELLO packets
 class HelloPacketSender(Thread):
-    def __init__(self, cntrl, helloint):
+    def __init__(self, cntrl, helloint, event):
         # Call the Thread class initializer
         super(HelloPacketSender, self).__init__()
         
@@ -311,6 +299,9 @@ class HelloPacketSender(Thread):
 
         # The Helloint interval for this router (we used a constant for the entire network)
         self.helloint = helloint
+
+        # Event (adding/removing a neighbor) that triggers a LSU
+        self.event = event
 
     # This function defines the activity of the HELLO packet sender - repeatedly sends out HELLO packets out of all
     # interfaces, sleeps for helloint seconds, then removes expired neighbors
@@ -328,7 +319,7 @@ class HelloPacketSender(Thread):
                                           helloint = interface.helloint
                                           )
                 # Send out the pacekt
-                self.cntrl.send_packet(hello_pkt)
+                self.cntrl.send_pkt(hello_pkt)
 
             # Sleep for the helloint interval
             time.sleep(self.helloint)
@@ -340,8 +331,9 @@ class HelloPacketSender(Thread):
                     # Decrement the uptime counter of the neighbor
                     new_uptime_value = neighbor.uptime_counter.decrement(HELLOINT_IN_SECS)
                     if new_uptime_value <= 0:
-                        # Neighbor has timed out, remove it
+                        # Neighbor has timed out, remove it and send out LSU about it
                         interface.remove_neighbor(neighbor.ip_addr)
+                        self.event.set()
             
 
 # This class defines a thread that handles incoming HELLO packets
@@ -356,10 +348,13 @@ class HelloManager(Thread):
         # The thread-safe queue from which this thread consumes packets
         self.pkt_queue = Queue()
 
+        # Event for triggering an LSU flood
+        self.event = Event()
+
     # This function define the activity of the HELLO manager - repeatedly consumes packets from queue and handles them
     def run(self):
         # Create the HELLO packet sender thread
-        hello_pkt_sender = HelloPacketSender(self.cntrl, HELLOINT_IN_SECS)
+        hello_pkt_sender = HelloPacketSender(self.cntrl, HELLOINT_IN_SECS, self.event)
         
         # Start the HELLO packet sender thread
         hello_pkt_sender.start()
@@ -367,6 +362,10 @@ class HelloManager(Thread):
         while True:
             # Consume packets from queue
             pkt = self.pkt_queue.get()
+            # Check packet validity
+            if self.cntrl.check_pwospf_pkt_validity(pkt) is False:
+                # Packet is invalid, drop
+                continue
 
             # Iterate over the router's interfaces
             for interface in self.cntrl.interfaces:
@@ -381,13 +380,14 @@ class HelloManager(Thread):
                     else:
                         # If neighbor not found, add it
                         interface.add_neighbor(pkt[PWOSPF]["router ID"], pkt[IP].src)
+                        self.event.set()
                     
                     break
 
 
 # This class defines a thread the periodically sends out LSU packets
 class LsuPacketSender(Thread):
-    def __init__(self, cntrl, lsuint):
+    def __init__(self, cntrl, lsuint, event):
         # Call the Thread class initializer
         super(LsuPacketSender, self).__init__()
         
@@ -397,12 +397,18 @@ class LsuPacketSender(Thread):
         # The LSUint interval for this router (we used a constant for the entire network)
         self.lsuint = lsuint
 
+        # Event to wait on for a change (adding/removing) in neighbors
+        self.event = event
+
     # This function defines the activity of the LSU packet sender - repeatedly sends out LSU packets out of all
     # interfaces then sleeps for LSUint seconds
     def run(self):
         while True:
+            # Send LSU packets to all neighbors
+            curr_seq_num = self.cntrl.get_lsu_seq()
+            ads = self.cntrl.get_lsu_ads()
             # Iterate over the router's interfaces
-            for interface in self.cntrl.interfaces:
+            for interface in self.interfaces:
                 # Iterate over the interface's neighbors
                 for neighbor in interface.neighbors:
                     # Create LSU packet
@@ -411,19 +417,19 @@ class LsuPacketSender(Thread):
                                         src = interface.ip_addr,
                                         dst = neighbor.ip_addr
                                         ) / PWOSPF(type = LSU_TYPE) / LSU(
-                                            seq = self.cntrl.get_lsu_seq(),
-                                            ads = self.cntrl.get_lsu_ads()
+                                            seq = curr_seq_num,
+                                            ads = ads
                                             )
                 # Send out LSU packet
-                self.cntrl.send_pkt(lsu_pkt)
+                self.send_pkt(lsu_pkt)
 
-            # Sleep for LSUint seconds
-            time.sleep(self.lsuint)
+            # Sleep for LSUint seconds or until there's a change in neighbors
+            self.event.wait(timeout = self.lsuint)
         
 
 # This class defines a thread that handles incoming LSU packets
 class LSUManager(Thread):
-    def __init__(self, cntrl, lsuint):
+    def __init__(self, cntrl, lsuint, event):
         # Call the Thread class initializer
         super(LSUManager, self).__init__()
 
@@ -440,6 +446,8 @@ class LSUManager(Thread):
         # dictionary of topology router neighbors (meaning their router ID)
         # TODO - how to initially fill this?
         self.topology = {}
+
+        self.event = event
 
     # This function runs the djikstra algorithm on the network topology, and returns the predecessors - the "next hop"
     # for each router
@@ -512,7 +520,7 @@ class LSUManager(Thread):
     # This function defines the activity of the LSU manager - repeatedly consume packets from queue and handle them
     def run(self):
         # Create the LSU packet sender thread
-        lsu_pkt_sender = LsuPacketSender(self.cntrl, self.lsuint)
+        lsu_pkt_sender = LsuPacketSender(self.cntrl, self.lsuint, self.event)
 
         # Start the LSU packet sender thread
         lsu_pkt_sender.start()
@@ -520,6 +528,10 @@ class LSUManager(Thread):
         while True:
             # Consume packets from queue
             pkt = self.pkt_queue.get()
+            # Check packet validity
+            if self.cntrl.check_pwospf_pkt_validity(pkt) is False:
+                # Packet is invalid, drop
+                continue
             should_run_djikstra = False
 
             # Get the router ID of the sender
@@ -606,7 +618,7 @@ class RouterController(Thread):
         self.areaID = areaID
 
         # List of router interfaces
-        self.intfs = interfaces
+        self.interfaces = interfaces
 
         # The interval in seconds between link state update broadcasts
         self.lsuint = lsuint
@@ -620,13 +632,13 @@ class RouterController(Thread):
         self.stop_event = Event()
 
         # The controller's ARP manager thread
-        self.arp_manager = None
+        self.arp_manager = ARPManager(self)
 
         # The controller's HELLO manager thread
-        self.hello_manager = None
+        self.hello_manager = HelloManager(self)
 
         # The controller's LSU manager thread
-        self.lsu_manager = None
+        self.lsu_manager = LSUManager(self, self.lsuint)
 
     # This function sends an incoming packet to the appropriate queue
     def process_pkt(self, pkt):
@@ -639,6 +651,18 @@ class RouterController(Thread):
         elif LSU in pkt:
             # LSU packet
             self.lsu_manager.pkt_queue.put(pkt)
+
+    # This function checks the validity of an incoming PWOSPF packet
+    def check_pwospf_pkt_validity(self, pkt):
+        if pkt[PWOSPF].version != VERSION_NUM:
+            return False
+        # TODO - check checksum
+        if pkt[PWOSPF]["area ID"] != AREA_ID:
+            return False
+        if pkt[PWOSPF].autype != AUTHENTICATION_TYPE:
+            return False
+        # Packet is valid
+        return True
 
     # This function sniffs the socket for packets
     def sniff_interface(self):
@@ -665,23 +689,21 @@ class RouterController(Thread):
     # to the appropriate thread
     def run(self):
         # Start ARP manager
-        arp_manager = ARPManager(self)
-        arp_manager.start()
-        self.arp_manager = arp_manager
+        self.arp_manager.start()
 
         # Start HELLO manager
-        hello_manager = HelloManager(self)
-        hello_manager.start()
-        self.hello_manager = hello_manager
+        self.hello_manager.start()
 
         # Start LSU manager
-        lsu_manager = LSUManager(self, self.lsuint)
-        lsu_manager.start()
-        self.lsu_manager = lsu_manager
+        self.lsu_manager.start()
 
         # TODO - maybe need to sniff all interfaces
         self.sniff_interface()
 
+
+######################################
+#---------- Packet Headers ----------#
+######################################
         
 # CPU metadata header
 class CPUMetadata(Packet):
