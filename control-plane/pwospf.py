@@ -8,7 +8,7 @@
 from select import select
 
 # Used for "layers" - common packet headers
-from scapy.all import conf, ETH_P_ALL, MTU, plist, Packet, Ether, IP, ARP, sendp
+from scapy.all import conf, ETH_P_ALL, MTU, PacketList, Packet, Ether, IP, ARP, sendp
 
 # Used for packets and to bind all the headers into the packet
 from scapy.packet import Packet, bind_layers
@@ -125,7 +125,7 @@ def sniff(store=False, prn=None, lfilter=None, stop_event=None, refresh=.1, *arg
         pass
     finally:
         s.close()
-    return plist.PacketList(lst, "Sniffed")
+    return PacketList(lst, "Sniffed")
 
 
 #########################################
@@ -203,7 +203,7 @@ class Interface:
     def remove_neighbor(self, cntrl, neighbor):
         # Remove the neighbor from this interface's dictionary
         del self.neighbors[neighbor.ip_addr]
-        # Remove this neighbor from the topology 
+        # Remove this neighbor from the topology
         del self.cntrl.topology[neighbor.router_id]
 
 
@@ -216,7 +216,7 @@ class AtomicCounter:
         # The lock used when accessing the counter
         self.lock = Lock()
 
-    # This function decrements the value of the counter by the provided amount    
+    # This function decrements the value of the counter by the provided amount
     def decrement(self, amount = 1):
         # Lock before accessing the counter
         with self.lock:
@@ -226,7 +226,7 @@ class AtomicCounter:
             # Return the new value of the counter
             return self.value
 
-    # This function sets the value of the counter to the provided new value    
+    # This function sets the value of the counter to the provided new value
     def set_value(self, new_value):
         # Lock before accessing the counter
         with self.lock:
@@ -268,7 +268,7 @@ class ARPManager(Thread):
         # Write entry to table
         p4runtime_lib.switch.SwitchConnection.WriteTableEntry(table_entry)
 
-    # This function define sthe activity of the ARP manager - repeatedly consume packets from queue, and either create
+    # This function defines the activity of the ARP manager - repeatedly consume packets from queue, and either create
     # a reply or add an entry to the ARP table
     def run(self):
         while True:
@@ -288,7 +288,7 @@ class ARPManager(Thread):
                             psrc = pkt[ARP].pdst,
                             hwdst = pkt[ARP].hwsrc,
                             pdst = pkt[ARP].psrc)
-                        
+
                         # Send out ARP reply
                         self.cntrl.send_pkt(arp_reply_pkt)
 
@@ -308,7 +308,7 @@ class HelloPacketSender(Thread):
     def __init__(self, cntrl, helloint, event):
         # Call the Thread class initializer
         super(HelloPacketSender, self).__init__()
-        
+
         # The router controller of this router
         self.cntrl = cntrl
 
@@ -330,8 +330,8 @@ class HelloPacketSender(Thread):
                                       src = interface.ip_addr,
                                       dst = PWOSPF_HELLO_DEST
                                       ) / PWOSPF(type = HELLO_TYPE) / Hello(
-                                          mask = interface.subnet_mask,
-                                          helloint = interface.helloint
+                                          networkMask = interface.subnet_mask,
+                                          helloInt = interface.helloint
                                           )
                 # Send out the pacekt
                 self.cntrl.send_pkt(hello_pkt)
@@ -350,11 +350,11 @@ class HelloPacketSender(Thread):
                         interface.remove_neighbor(self.cntrl, neighbor)
                         # Set the event to trigger an LSU
                         self.event.set()
-            
+
 
 # This class defines a thread that handles incoming HELLO packets
 class HelloManager(Thread):
-    def __init__(self, cntrl):
+    def __init__(self, cntrl, event):
         # Call the Thread class initializer
         super(HelloManager, self).__init__()
 
@@ -365,13 +365,13 @@ class HelloManager(Thread):
         self.pkt_queue = Queue()
 
         # Event for triggering an LSU flood
-        self.event = Event()
+        self.event = event
 
     # This function define the activity of the HELLO manager - repeatedly consumes packets from queue and handles them
     def run(self):
         # Create the HELLO packet sender thread
         hello_pkt_sender = HelloPacketSender(self.cntrl, HELLOINT_IN_SECS, self.event)
-        
+
         # Start the HELLO packet sender thread
         hello_pkt_sender.start()
 
@@ -407,7 +407,7 @@ class LsuPacketSender(Thread):
     def __init__(self, cntrl, lsuint, event):
         # Call the Thread class initializer
         super(LsuPacketSender, self).__init__()
-        
+
         # The router controller of this router
         self.cntrl = cntrl
 
@@ -443,7 +443,7 @@ class LsuPacketSender(Thread):
 
             # Sleep for LSUint seconds or until there's a change in topology
             self.event.wait(timeout = self.lsuint)
-        
+
 
 # This class defines a thread that handles incoming LSU packets
 class LSUManager(Thread):
@@ -473,7 +473,7 @@ class LSUManager(Thread):
         distances = {key : float('inf') for key in self.cntrl.topology.keys()}
         # Initialize this router's distance to 0
         distances[self.cntrl.router_id] = 0
-        
+
         # Initialize a heap (queue) of all nodes and their distances
         nodes_heap = [(value, key) for key, value in distances]
         heapq.heapify(nodes_heap)
@@ -504,7 +504,7 @@ class LSUManager(Thread):
 
         # Return the predecessors of all routers
         return predecessors
-    
+
     # This function creates and adds an entry to the routing table
     def fill_routing_table(self, predecessors):
         # Fill a set with the router IDs of all neighbors
@@ -533,7 +533,7 @@ class LSUManager(Thread):
 
             # Write entry to table
             p4runtime_lib.switch.SwitchConnection.WriteTableEntry(table_entry)
-                        
+
     # This function defines the activity of the LSU manager - repeatedly consume packets from queue and handle them
     def run(self):
         # Create the LSU packet sender thread
@@ -591,7 +591,7 @@ class LSUManager(Thread):
                             if topology_neighbor_neighbor.subnet != LSUad.subnet:
                                 continue
                             if topology_neighbor_neighbor.mask != LSUad.mask:
-                                continue 
+                                continue
 
                     # New neighbor, add it
                     src_router.neighbors[LSUad.routerId] = TopologyNeighbor(LSUad.routerId,
@@ -602,7 +602,7 @@ class LSUManager(Thread):
 
                 # Add the router ID to the neighbors set
                 found_neighbors_ids.add(LSUad.routerId)
-                    
+
             # Iterate over the source router topology neighbors
             for neighbor in src_router.neighbors.values():
                 # If the neighbor was found in the LSU packet
@@ -634,7 +634,7 @@ class LSUManager(Thread):
                     self.cntrl.send_pkt(pkt)
 
 
-# This class defines a thread that controlls the router 
+# This class defines a thread that controlls the router
 class RouterController(Thread):
     def __init__(self, sw, routerID, MAC, areaID, interfaces, lsuint=2, start_wait=0.3):
         # Call the Thread class initializer
@@ -667,14 +667,17 @@ class RouterController(Thread):
         # Stop event for sniffing packets
         self.stop_event = Event()
 
+        # Stop events for topology changes
+        self.topology_change_event = Event()
+
         # The controller's ARP manager thread
         self.arp_manager = ARPManager(self)
 
         # The controller's HELLO manager thread
-        self.hello_manager = HelloManager(self)
+        self.hello_manager = HelloManager(self, self.topology_change_event)
 
         # The controller's LSU manager thread
-        self.lsu_manager = LSUManager(self, self.lsuint)
+        self.lsu_manager = LSUManager(self, self.lsuint, self.topology_change_event)
 
         # An adjency list describing the network topology - a dictionary of routers (key is neighbor ID, value is
         # neighbor instance), each holding a dictionary of topoloy neighbors (key is router ID, value is
@@ -683,7 +686,7 @@ class RouterController(Thread):
 
     def fill_initial_topology(self):
         # TODO - implement
-        pass
+        return {}
 
     # This function sends an incoming packet to the appropriate queue
     def process_pkt(self, pkt):
@@ -703,10 +706,10 @@ class RouterController(Thread):
         for interface in self.interfaces:
             if interface.port == ingress_port:
                 return interface
-        
+
         # No interface matches
         return None
-         
+
 
     # This function checks the validity of an incoming PWOSPF packet
     def check_pwospf_pkt_validity(self, pkt):
@@ -721,7 +724,7 @@ class RouterController(Thread):
             return False
         # Packet is valid
         return True
-    
+
     # This function checks the validity of an incoming HELLO packet
     def check_hello_pkt_validity(self, pkt, ingress_interface):
         if pkt[Hello].networkMask != ingress_interface.subnet_mask:
@@ -729,7 +732,7 @@ class RouterController(Thread):
         if pkt[Hello].HelloInt != ingress_interface.helloint:
             return False
         return True
-    
+
     # This function sends a packet to the data plane
     def send_pkt(self, pkt):
         sendp(pkt, iface = self.sw)
@@ -740,10 +743,10 @@ class RouterController(Thread):
         self.lsu_seq = self.lsu_seq + 1
         # return the sequence number
         return self.lsu_seq
-    
+
     # This function returns the LSUads for outgoing LSU packets
     def get_lsu_ads(self):
-        neighbors = self.cntrl.topology[self.routerID].neighbors
+        neighbors = self.topology[self.routerID].neighbors
         ads = []
         for neighbor in neighbors:
             ads.append(LSUad(subnet = neighbor.subnet,
@@ -769,7 +772,7 @@ class RouterController(Thread):
 ######################################
 #---------- Packet Headers ----------#
 ######################################
-        
+
 # CPU metadata header
 class CPUMetadata(Packet):
     name = "CPUMetadata"
@@ -788,8 +791,8 @@ class PWOSPF(Packet):
         # Type of PWOSPF packet
         ByteField("type", 0),
         # The length of the packet
-        LenField("packet length", 0),
-        # The source router ID 
+        LenField("packetLen", 0),
+        # The source router ID
         IntField("routerId", 0),
         # The source area ID
         IntField("areaID", AREA_ID),
@@ -838,7 +841,7 @@ class LSU(PWOSPF):
         # Packet sequence number
         IntField("sequence", INVALID_SEQUENCE_NUM),
         # TTL
-        IntEnumField("TTL", 0),
+        IntField("TTL", 0),
         # Number of advertisments
         LongField("numAds", 0),
         # Advertisments payload
@@ -856,6 +859,26 @@ bind_layers(PWOSPF, Hello, type=HELLO_TYPE)
 bind_layers(PWOSPF, LSU, type=LSU_TYPE)
 
 if __name__ == "__main__":
-    interfaces = []
-    router_controller = RouterController("eth0", "", "", AREA_ID, interfaces)
+    interfaces = [
+        Interface(
+            ip_addr = "192.168.1.1",
+            subnet_mask = "255.255.255.0",
+            helloint = HELLOINT_IN_SECS,
+            port = 1
+        ),
+        Interface(
+            ip_addr = "192.168.2.1",
+            subnet_mask = "255.255.255.0",
+            helloint = HELLOINT_IN_SECS,
+            port = 2
+        )
+    ]
+    router_controller = RouterController(
+        sw = None,
+        routerID = 1,
+        MAC = "00:00:00:00:00:01",
+        areaID = AREA_ID,
+        interfaces = interfaces,
+        lsuint = LSUINT_IN_SECS
+    )
     router_controller.start()
