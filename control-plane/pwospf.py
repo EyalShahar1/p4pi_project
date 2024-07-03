@@ -8,7 +8,7 @@
 from select import select
 
 # Used for "layers" - common packet headers
-from scapy.all import conf, ETH_P_ALL, MTU, PacketList, Packet, Ether, IP, ARP, sendp
+from scapy.all import conf, ETH_P_ALL, MTU, PacketList, Packet, Ether, IP, ARP, sendp, get_if_list
 
 # Used for packets and to bind all the headers into the packet
 from scapy.packet import Packet, bind_layers
@@ -755,9 +755,22 @@ class RouterController(Thread):
             return False
         return True
 
+    def get_if(self):
+        ifs= get_if_list()
+        print(ifs)
+        iface=None # "h1-eth0"
+        for i in ifs:
+            if "eth0" in i:
+                iface=i
+                break;
+        if not iface:
+            print("Cannot find eth0 interface")
+            exit(1)
+        return iface
+    
     # This function sends a packet to the data plane
     def send_pkt(self, pkt):
-        sendp(pkt, iface = self.sw)
+        sendp(pkt, iface = None)
 
     # This function gets an LSU sequence number for a packet
     def get_lsu_seq(self):
