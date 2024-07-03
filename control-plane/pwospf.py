@@ -14,7 +14,7 @@ from scapy.all import conf, ETH_P_ALL, MTU, PacketList, Packet, Ether, IP, ARP, 
 from scapy.packet import Packet, bind_layers
 
 # Used to parse the different fields in each header in the packet
-from scapy.fields import ByteField, LenField, IntField, ShortField, LongField, IntEnumField, PacketListField
+from scapy.fields import ByteField, LenField, IntField, ShortField, LongField, IntEnumField, PacketListField, IPField
 
 # Used for the different threads
 from threading import Thread, Event, Lock
@@ -23,7 +23,7 @@ from threading import Thread, Event, Lock
 from queue import Queue
 
 # Used to fetch the current time, in order to keep track of neighbors and topology
-from time import time
+from time import time, sleep
 
 # Used in the implementation of the djikstra algorithm
 import heapq
@@ -329,7 +329,7 @@ class HelloPacketSender(Thread):
                                   dst = BROADCAST_MAC_ADDR) / IP(
                                       src = interface.ip_addr,
                                       dst = PWOSPF_HELLO_DEST
-                                      ) / PWOSPF(type = HELLO_TYPE) / Hello(
+                                      ) / CPUMetadata(ingressPort = 1) /  PWOSPF(type = HELLO_TYPE) / Hello(
                                           networkMask = interface.subnet_mask,
                                           HelloInt = interface.helloint
                                           )
@@ -337,7 +337,7 @@ class HelloPacketSender(Thread):
                 self.cntrl.send_pkt(hello_pkt)
 
             # Sleep for the helloint interval
-            time.sleep(self.helloint)
+            sleep(self.helloint)
 
             # Iterate over all router interfaces
             for interface in self.cntrl.interfaces:
@@ -520,6 +520,7 @@ class LSUManager(Thread):
                 predecessor[router_id] = predecessor[predecessor]
                 predecessor = predecessors[router_id]
 
+        # TODO - make sure we don't get duplicate entries
         for router_id in predecessors:
             predecessor = predecessors[router_id]
             table_entry = p4runtime_lib.helper.P4InfoHelper.buildTableEntry(
@@ -835,7 +836,7 @@ class Hello(PWOSPF):
     fields_desc = [
         # The network mask of the source
         # TODO - might need to be 0xFFFFFFFF, and might need to be IPField
-        IntField("networkMask", '255.255.255.0'),
+        IPField("networkMask", "255.255.255.0"),
         # Helloint interval
         ShortField("HelloInt", HELLOINT_IN_SECS),
         # Padding
