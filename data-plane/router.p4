@@ -9,7 +9,7 @@ typedef bit<32> ip4Addr_t;
 const macAddr_t BROADCAST_ADDR  = 0xffffffffffff;
 const ip4Addr_t ALLSPFROUTERS_ADDR = 0xe0000005;
 
-const port_t CPU_PORT           = 0x1;
+const port_t CPU_PORT           = 2;
 const bit<8> PROTO_OSPF          = 89;
 
 const bit<16> ARP_OP_REQ        = 0x0001;
@@ -33,10 +33,9 @@ header ethernet_t {
 // TODO - might be missing some data and might not need srcAddr, tbd
 // CPU header
 header cpu_t {
-    // Marks packets used to generate ARP requests
+    bit<16>     etherType;
     port_t      ingress_port;
-    bit<1>      is_arp_needed;
-    bit<6>      padding;
+    bit<7>      padding;
 }
 
 // ARP header
@@ -170,6 +169,10 @@ control MyIngress(inout headers hdr,
 
     action send_to_cpu() {
         standard_metadata.egress_spec = CPU_PORT;
+        hdr.cpu.setValid();
+        hdr.cpu.etherType = hdr.ethernet.etherType;
+        hdr.cpu.ingress_port = standard_metadata.ingress_port;
+        hdr.ethernet.etherType = TYPE_CPU_METADATA;
     }
 
     // TODO - check if broadcast port is correct
@@ -187,16 +190,6 @@ control MyIngress(inout headers hdr,
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
 
-    action set_dst_and_src_mac(macAddr_t dst_mac) {
-        hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
-        hdr.ethernet.dstAddr = dst_mac;
-    }
-
-    action generate_arp_req() {
-        hdr.cpu.is_arp_needed = (bit<1>) true;
-        standard_metadata.egress_spec = CPU_PORT;
-    }
-
     /*****     TABLES     *****/
 
     // Destination IP address -> next hop IP address, output port
@@ -210,18 +203,6 @@ control MyIngress(inout headers hdr,
         }
         size = 256;
         default_action = drop;
-    }
-
-    // Next hop IP address -> destination MAC address
-    table arp_table {
-        key = {meta.next_hop_ip_add: exact;}
-
-        actions = {
-            set_dst_and_src_mac;
-            generate_arp_req;
-        }
-        size = 256;
-        default_action = generate_arp_req;
     }
 
 
@@ -259,8 +240,8 @@ control MyEgress(inout headers hdr,
         hdr.ethernet.dstAddr = dst_mac;
     }
 
-    action drop() {
-        mark_to_drop(standard_metadata);
+    action generate_arp_req() {
+        standard_metadata.egress_spec = CPU_PORT;
     }
     // this table entries may be populated using arp protocol implementation
     table forwarding_table {
@@ -268,11 +249,11 @@ control MyEgress(inout headers hdr,
 
         actions = {
             set_dst_and_src_mac;
-            drop;
+            generate_arp_req;
             NoAction;
         }
         size = 256;
-        default_action = NoAction();
+        default_action = generate_arp_req();
     }
     apply {
         forwarding_table.apply();
@@ -305,7 +286,10 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
 control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         packet.emit(hdr.ethernet);
+        packet.emit(hdr.cpu);
+        packet.emit(hdr.arp);
         packet.emit(hdr.ipv4);
+        packet.emit(hdr.ospf);
     }
     // apply {
     //     packet.emit(hdr.ethernet);
