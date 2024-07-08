@@ -85,7 +85,7 @@ struct headers {
     cpu_t               cpu;
     arp_t               arp;
     ipv4_t              ipv4;
-    ospf_t              ospf;          
+    ospf_t              ospf;
 }
 
 struct metadata {
@@ -155,7 +155,7 @@ control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
             hdr.ipv4.dstAddr },
             hdr.ipv4.hdr_checksum,
             HashAlgorithm.csum16);
-        }      
+        }
 }
 
 control MyIngress(inout headers hdr,
@@ -163,7 +163,7 @@ control MyIngress(inout headers hdr,
                   inout standard_metadata_t standard_metadata) {
 
     /*****     ACTIONS     *****/
-    
+
     action drop() {
         mark_to_drop(standard_metadata);
     }
@@ -176,7 +176,7 @@ control MyIngress(inout headers hdr,
     action bcast() {
         standard_metadata.egress_port = BROADCAST_PORT; // Broadcast port
     }
-    
+
     // this action changes our next hop based on the data from the routing table
     // the next hop address will determine the destination MAC address
     action ipv4_forward(ip4Addr_t next_hop, port_t port) {
@@ -241,7 +241,7 @@ control MyIngress(inout headers hdr,
                 // Incoming OSPF and ARP packets are always sent to CPU
                 send_to_cpu();
             }
-            return; // wont go to routing table            
+            return; // wont go to routing table
         }
         // If packet is not from CPU and not ARP/OSPF - apply routing
         routing_table.apply();
@@ -269,12 +269,12 @@ control MyEgress(inout headers hdr,
         actions = {
             set_dst_and_src_mac;
             drop;
-            NoAction;            
+            NoAction;
         }
         size = 256;
         default_action = NoAction();
-    }    
-    apply {        
+    }
+    apply {
         forwarding_table.apply();
      }
 }
@@ -297,9 +297,9 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
             hdr.ipv4.srcAddr,
             hdr.ipv4.dstAddr },
             hdr.ipv4.hdr_checksum,
-            HashAlgorithm.csum16);    
+            HashAlgorithm.csum16);
         // can add more cases if we'll have more packets type with check sum
-        }            
+        }
 }
 
 control MyDeparser(packet_out packet, in headers hdr) {
