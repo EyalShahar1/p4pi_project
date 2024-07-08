@@ -107,6 +107,7 @@ def sniff(store=False, prn=None, lfilter=None, stop_event=None, refresh=.1, *arg
                 break
             sel = select([s], [], [], refresh)
             if s in sel[0]:
+                print("received packet\n")
                 # Receive data from socket as bytes object, MTU "infinite"
                 p = s.recv(MTU)
                 if p is None:
