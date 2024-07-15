@@ -11,12 +11,18 @@
         "r1": {
             "ip": "10.0.2.2/24",
             "mac": "08:00:00:00:02:22",
-            "commands": []
+            "commands": [
+              "route add default gw 10.0.2.20 dev eth0",
+              "arp -i eth0 -s 10.0.2.20 08:00:00:00:02:00"
+            ]
         },
         "r2": {
             "ip": "10.0.3.3/24",
             "mac": "08:00:00:00:03:33",
-            "commands": []
+            "commands": [
+              "route add default gw 10.0.3.30 dev eth0",
+              "arp -i eth0 -s 10.0.3.30 08:00:00:00:03:00"
+            ]
         },
         "h2": {
             "ip": "10.0.4.4/24",

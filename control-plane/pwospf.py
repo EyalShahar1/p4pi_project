@@ -4,6 +4,8 @@
 #---------- Imports ----------#
 ###############################
 
+from __future__ import annotations
+
 # Used in sniff()
 from select import select
 
@@ -36,10 +38,17 @@ import p4runtime_lib.switch
 
 import sys
 
+from typing import Dict
+
+import ipaddress
+
 
 arp_queue = Queue()
 hello_queue = Queue()
 lsu_queue = Queue()
+
+multicast_group_id = 1
+egress_ports = [1, 3]
 
 
 #################################
@@ -66,6 +75,7 @@ PWOSPF_HELLO_DEST = '224.0.0.5'
 
 # The type code of CPU metadata packets
 TYPE_CPU_METADATA = 0x080a
+TYPE_IPV4 = 0x0800
 
 # The broadcast MAC address
 BROADCAST_MAC_ADDR = 'ff:ff:ff:ff:ff:ff'
@@ -219,7 +229,7 @@ class Interface:
 
 # This class defines a locked counter that can be safely accessed from multiple threads
 class AtomicCounter:
-    def __init__(self, initial=0):
+    def __init__(self, initial = 0):
         # The initial values of the counter
         self.value = initial
 
@@ -333,7 +343,8 @@ class HelloPacketSender(Thread):
             for interface in self.cntrl.interfaces:
                 # Create the HELLO packet
                 hello_pkt = Ether(src = self.cntrl.MAC,
-                                  dst = BROADCAST_MAC_ADDR) / IP(
+                                  dst = BROADCAST_MAC_ADDR,
+                                  type = TYPE_CPU_METADATA) / CPUMetadata(origEtherType = 0x0800) / IP(
                                       src = interface.ip_addr,
                                       dst = PWOSPF_HELLO_DEST,
                                       proto = OSPF_PROT_NUM
@@ -342,8 +353,7 @@ class HelloPacketSender(Thread):
                                           HelloInt = interface.helloint
                                           )
                 # Send out the pacekt
-                print("sending hello packet from", interface.ip_addr)
-                print("hello sender: pkt", hello_pkt)
+                print("sending hello packet from", interface.ip_addr, "to port", interface.port)
                 self.cntrl.send_pkt(hello_pkt)
 
             # Sleep for the helloint interval
@@ -388,6 +398,16 @@ class HelloManager(Thread):
             pkt = hello_queue.get()
             print("hello manager: received hello packet")
             # Check packet validity
+            bIsFromMe = False
+            for interface in self.cntrl.interfaces:
+                if pkt[IP].src == interface.ip_addr:
+                    bIsFromMe = True
+                    break
+
+            if bIsFromMe:
+                print("hello manager: this packet is from me, ip", pkt[IP].src)
+                continue
+
             if self.cntrl.check_pwospf_pkt_validity(pkt) is False:
                 print("hello manager: received invalid hello (pwospf) packet")
                 # Packet is invalid, drop
@@ -439,7 +459,7 @@ class LsuPacketSender(Thread):
             # Iterate over the router's interfaces
             for interface in self.cntrl.interfaces:
                 # Iterate over the interface's neighbors
-                for neighbor in interface.neighbors:
+                for neighbor in interface.neighbors.values():
                     # Create LSU packet
                     lsu_pkt = Ether(src = self.cntrl.MAC,
                                     dst = BROADCAST_MAC_ADDR) / IP(
@@ -447,10 +467,11 @@ class LsuPacketSender(Thread):
                                         dst = neighbor.ip_addr
                                         ) / PWOSPF(type = LSU_TYPE) / LSU(
                                             sequence = curr_seq_num,
-                                            numAds = ads.len(),
+                                            numAds = len(ads),
                                             LSUads = ads
                                             )
                     # Send out LSU packet
+                    print("lsu sender: sending lsu packet from", interface.ip_addr, "to port", interface.port)
                     self.cntrl.send_pkt(lsu_pkt)
 
             # Sleep for LSUint seconds or until there's a change in topology
@@ -556,6 +577,7 @@ class LSUManager(Thread):
         while True:
             # Consume packets from queue
             pkt = lsu_queue.get()
+            print("lsu manager: got lsu packet from", pkt[IP].src)
             # Check packet validity
             if self.cntrl.check_pwospf_pkt_validity(pkt) is False:
                 # Packet is invalid, drop
@@ -717,13 +739,13 @@ class RouterController(Thread):
             del self.topology[key_to_remove]
 
     def fill_initial_topology(self):
-        # TODO - implement
-        return {}
+        topology = {self.routerID : {}}
+        return topology
 
     # This function sends an incoming packet to the appropriate queue
     def process_pkt(self, pkt):
-        print("processing pkt:")
-        self.print_packet_layers(pkt)
+        print("controller: processing pkt")
+        #self.print_packet_layers(pkt)
         if ARP in pkt:
             print("controller: received arp packet")
             # ARP packet
@@ -741,6 +763,7 @@ class RouterController(Thread):
 
     # Getting the ingress interface of a packet
     def get_ingress_interface(self, pkt):
+        print("looking for ingress interface for port", pkt[CPUMetadata].ingressPort)
         ingress_port = pkt[CPUMetadata].ingressPort
         for interface in self.interfaces:
             if interface.port == ingress_port:
@@ -774,6 +797,7 @@ class RouterController(Thread):
 
     # This function sends a packet to the data plane
     def send_pkt(self, pkt):
+        print("sending packet to interface", self.sw)
         sendp(pkt, iface = self.sw)
 
     # This function gets an LSU sequence number for a packet
@@ -785,14 +809,16 @@ class RouterController(Thread):
 
     # This function returns the LSUads for outgoing LSU packets
     def get_lsu_ads(self):
-        topology = self.get_topology()
         ads = []
-        if len(topology) > 0:
-            neighbors = topology[self.routerID].neighbors
-            for neighbor in neighbors:
-                ads.append(LSUad(subnet = neighbor.subnet,
-                                 mask = neighbor.mask,
-                                 routerID = neighbor.routerID))
+        for interface in self.interfaces:
+            neighbors = interface.neighbors
+            for neighbor in neighbors.values():
+                neighbor_subnet = ipaddress.IPv4Network(neighbor.ip_addr + "/" + interface.subnet_mask, strict = False)
+                neighbor_subnet = neighbor_subnet.network_address
+                print(neighbor_subnet)
+                ads.append(LSUad(subnet = neighbor_subnet,
+                                 mask = interface.subnet_mask,
+                                 routerId = neighbor.router_id))
         return ads
 
     def print_packet_layers(self, pkt):
@@ -800,6 +826,9 @@ class RouterController(Thread):
         while layer:
             layer.show()
             layer = layer.payload
+
+    def init_multicast_group(self):
+        p4runtime_lib.helper.P4InfoHelper.buildMulticastGroupEntry(multicast_group_id, egress_ports)
 
     # This function defines the activity of the router controller - repeatedly sniffs for packets and distributed them
     # to the appropriate thread
@@ -824,7 +853,7 @@ class RouterController(Thread):
 class CPUMetadata(Packet):
     name = "CPUMetadata"
     fields_desc = [
-        XShortEnumField("etherType", 0x0800, {0x0800: "IP", 0x0806: "ARP"}),
+        XShortEnumField("origEtherType", 0x0800, {0x0800: "IP", 0x0806: "ARP"}),
         # Packet ingress port
         ShortField("ingressPort", 0)
     ]
@@ -873,10 +902,10 @@ class LSUad(Packet):
     fields_desc = [
         # Subnet
         # TODO - maybe IPField?
-        IntField("subnet", '0.0.0.0'),
+        IPField("subnet", '0.0.0.0'),
         # Mask
         # maybe IPField?
-        IntField("mask", '255.255.255.0'),
+        IPField("mask", '255.255.255.0'),
         # Router ID
         IntField("routerId", 0)
     ]
@@ -919,11 +948,17 @@ if __name__ == "__main__":
                 ip_addr = "10.0.2.2",
                 subnet_mask = "255.255.255.0",
                 helloint = HELLOINT_IN_SECS,
-                port = 2
+                port = 1
+            ),
+            Interface(
+                ip_addr = "10.0.2.2",
+                subnet_mask = "255.255.255.0",
+                helloint = HELLOINT_IN_SECS,
+                port = 3
             )
         ]
         router_controller = RouterController(
-            sw = None,
+            sw = "eth0",
             routerID = 1,
             MAC = "08:00:00:00:02:22",
             areaID = AREA_ID,
@@ -939,11 +974,17 @@ if __name__ == "__main__":
                 ip_addr = "10.0.3.3",
                 subnet_mask = "255.255.255.0",
                 helloint = HELLOINT_IN_SECS,
-                port = 2
+                port = 1
+            ),
+            Interface(
+                ip_addr = "10.0.3.3",
+                subnet_mask = "255.255.255.0",
+                helloint = HELLOINT_IN_SECS,
+                port = 3
             )
         ]
         router_controller = RouterController(
-            sw = None,
+            sw = "eth0",
             routerID = 2,
             MAC = "08:00:00:00:03:33",
             areaID = AREA_ID,
