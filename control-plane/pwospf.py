@@ -14,7 +14,7 @@ from scapy.all import conf, ETH_P_ALL, MTU, PacketList, Packet, Ether, IP, ARP, 
 from scapy.packet import Packet, bind_layers
 
 # Used to parse the different fields in each header in the packet
-from scapy.fields import ByteField, LenField, IntField, ShortField, LongField, IntEnumField, PacketListField, IPField
+from scapy.fields import ByteField, LenField, IntField, ShortField, LongField, IntEnumField, PacketListField, IPField, XShortEnumField
 
 # Used for the different threads
 from threading import Thread, Event, Lock
@@ -33,6 +33,13 @@ import p4runtime_lib.helper
 
 # Used for sending the table entries to the data plane
 import p4runtime_lib.switch
+
+import sys
+
+
+arp_queue = Queue()
+hello_queue = Queue()
+lsu_queue = Queue()
 
 
 #################################
@@ -107,18 +114,20 @@ def sniff(store=False, prn=None, lfilter=None, stop_event=None, refresh=.1, *arg
                 break
             sel = select([s], [], [], refresh)
             if s in sel[0]:
-                print("received packet\n")
+                print("sniff: received packet")
                 # Receive data from socket as bytes object, MTU "infinite"
                 p = s.recv(MTU)
                 if p is None:
                     break
                 if lfilter and not lfilter(p):
+                    print("sniff: packet filtered")
                     # Possible filtering of the packet
                     continue
                 if store:
                     # Add the packet to the list
                     lst.append(p)
                 if prn:
+                    print("sniff: calling func")
                     r = prn(p)
                     if r is not None:
                         print(r)
@@ -251,9 +260,6 @@ class ARPManager(Thread):
         # The router controller of this router
         self.cntrl = cntrl
 
-        # The thread-safe queue from which this thread consumes packets
-        self.pkt_queue = Queue()
-
     # This function creates and adds an entry to the forwarding table
     def add_forwarding_entry(self, dst_ip_addr, dst_mac_addr):
         # Create the table entry
@@ -274,7 +280,7 @@ class ARPManager(Thread):
     def run(self):
         while True:
             # Consume packets from queue
-            pkt = self.pkt_queue.get()
+            pkt = arp_queue.get()
 
             # Check if packet is an ARP request
             if pkt[ARP].op == ARP_OP_REQ:
@@ -329,12 +335,15 @@ class HelloPacketSender(Thread):
                 hello_pkt = Ether(src = self.cntrl.MAC,
                                   dst = BROADCAST_MAC_ADDR) / IP(
                                       src = interface.ip_addr,
-                                      dst = PWOSPF_HELLO_DEST
-                                      ) / CPUMetadata(ingressPort = 1) /  PWOSPF(type = HELLO_TYPE) / Hello(
+                                      dst = PWOSPF_HELLO_DEST,
+                                      proto = OSPF_PROT_NUM
+                                      ) / PWOSPF(type = HELLO_TYPE) / Hello(
                                           networkMask = interface.subnet_mask,
                                           HelloInt = interface.helloint
                                           )
                 # Send out the pacekt
+                print("sending hello packet from", interface.ip_addr)
+                print("hello sender: pkt", hello_pkt)
                 self.cntrl.send_pkt(hello_pkt)
 
             # Sleep for the helloint interval
@@ -362,9 +371,6 @@ class HelloManager(Thread):
         # The router controller of this router
         self.cntrl = cntrl
 
-        # The thread-safe queue from which this thread consumes packets
-        self.pkt_queue = Queue()
-
         # Event for triggering an LSU flood
         self.event = event
 
@@ -377,10 +383,13 @@ class HelloManager(Thread):
         hello_pkt_sender.start()
 
         while True:
+            print("hello manager: waiting for packet")
             # Consume packets from queue
-            pkt = self.pkt_queue.get()
+            pkt = hello_queue.get()
+            print("hello manager: received hello packet")
             # Check packet validity
             if self.cntrl.check_pwospf_pkt_validity(pkt) is False:
+                print("hello manager: received invalid hello (pwospf) packet")
                 # Packet is invalid, drop
                 continue
 
@@ -388,11 +397,13 @@ class HelloManager(Thread):
             ingress_interface = self.cntrl.get_ingress_interface(pkt)
 
             if self.cntrl.check_hello_pkt_validity(pkt, ingress_interface) is False:
+                print("hello manager: received invalid hello packet")
                 # Packet is invalid, drop
                 continue
 
             # Check if the interface already knows this neighbor
             neighbor = ingress_interface.neighbors.get(pkt[IP].src)
+            print("hello manager: received hello packet from", neighbor)
             if neighbor is not None:
                 # Reset the neighbor's HELLO counter
                 neighbor.uptime_counter.set_value(INITIAL_HELLOINT)
@@ -457,9 +468,6 @@ class LSUManager(Thread):
 
         # This router's LSUint (is actually a constant for the entire network)
         self.lsuint = lsuint
-
-        # The thread-safe queue from which this thread consumes packets
-        self.pkt_queue = Queue()
 
         self.event = event
 
@@ -547,7 +555,7 @@ class LSUManager(Thread):
 
         while True:
             # Consume packets from queue
-            pkt = self.pkt_queue.get()
+            pkt = lsu_queue.get()
             # Check packet validity
             if self.cntrl.check_pwospf_pkt_validity(pkt) is False:
                 # Packet is invalid, drop
@@ -714,15 +722,22 @@ class RouterController(Thread):
 
     # This function sends an incoming packet to the appropriate queue
     def process_pkt(self, pkt):
+        print("processing pkt:")
+        self.print_packet_layers(pkt)
         if ARP in pkt:
+            print("controller: received arp packet")
             # ARP packet
-            self.arp_manager.pkt_queue.put(pkt)
+            arp_queue.put(pkt)
         elif Hello in pkt:
+            print("controller: received hello packet")
             # HELLO packet
-            self.hello_manager.pkt_queue.put(pkt)
+            hello_queue.put(pkt)
         elif LSU in pkt:
+            print("controller: received lsu packet")
             # LSU packet
-            self.lsu_manager.pkt_queue.put(pkt)
+            lsu_queue.put(pkt)
+        else:
+            print("controller: received unknown packet")
 
     # Getting the ingress interface of a packet
     def get_ingress_interface(self, pkt):
@@ -793,6 +808,12 @@ class RouterController(Thread):
                                  routerID = neighbor.routerID))
         return ads
 
+    def print_packet_layers(self, pkt):
+        layer = pkt
+        while layer:
+            layer.show()
+            layer = layer.payload
+
     # This function defines the activity of the router controller - repeatedly sniffs for packets and distributed them
     # to the appropriate thread
     def run(self):
@@ -816,6 +837,7 @@ class RouterController(Thread):
 class CPUMetadata(Packet):
     name = "CPUMetadata"
     fields_desc = [
+        XShortEnumField("etherType", 0x0800, {0x0800: "IP", 0x0806: "ARP"}),
         # Packet ingress port
         ShortField("ingressPort", 0)
     ]
@@ -898,26 +920,50 @@ bind_layers(PWOSPF, Hello, type=HELLO_TYPE)
 bind_layers(PWOSPF, LSU, type=LSU_TYPE)
 
 if __name__ == "__main__":
-    interfaces = [
-        Interface(
-            ip_addr = "192.168.1.1",
-            subnet_mask = "255.255.255.0",
-            helloint = HELLOINT_IN_SECS,
-            port = 1
-        ),
-        Interface(
-            ip_addr = "192.168.2.1",
-            subnet_mask = "255.255.255.0",
-            helloint = HELLOINT_IN_SECS,
-            port = 2
+
+    if len(sys.argv) != 2:
+        print("wrong number of args", len(sys.argv))
+        sys.exit(1)
+
+    if sys.argv[1] == "1":
+        print("starting router 1")
+        interfaces = [
+            Interface(
+                ip_addr = "10.0.2.2",
+                subnet_mask = "255.255.255.0",
+                helloint = HELLOINT_IN_SECS,
+                port = 2
+            )
+        ]
+        router_controller = RouterController(
+            sw = None,
+            routerID = 1,
+            MAC = "08:00:00:00:02:22",
+            areaID = AREA_ID,
+            interfaces = interfaces,
+            lsuint = LSUINT_IN_SECS
         )
-    ]
-    router_controller = RouterController(
-        sw = None,
-        routerID = 1,
-        MAC = "00:00:00:00:00:01",
-        areaID = AREA_ID,
-        interfaces = interfaces,
-        lsuint = LSUINT_IN_SECS
-    )
-    router_controller.start()
+        router_controller.start()
+
+    elif sys.argv[1] == "2":
+        print("starting router 2")
+        interfaces = [
+            Interface(
+                ip_addr = "10.0.3.3",
+                subnet_mask = "255.255.255.0",
+                helloint = HELLOINT_IN_SECS,
+                port = 2
+            )
+        ]
+        router_controller = RouterController(
+            sw = None,
+            routerID = 2,
+            MAC = "08:00:00:00:03:33",
+            areaID = AREA_ID,
+            interfaces = interfaces,
+            lsuint = LSUINT_IN_SECS
+        )
+        router_controller.start()
+
+    else:
+        print("unknown router number", sys.argv[1])
