@@ -286,7 +286,6 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
 
 control MyDeparser(packet_out packet, in headers hdr) {
     apply {
-        // emit the relevant headers
         packet.emit(hdr.ethernet);
         packet.emit(hdr.cpu);
         packet.emit(hdr.arp);
