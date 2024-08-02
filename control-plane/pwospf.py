@@ -1,5 +1,5 @@
-# TODO - gateway router
-# TODO - arp timeout?
+#!/usr/bin/env python3
+
 ###############################
 #---------- Imports ----------#
 ###############################
@@ -20,7 +20,7 @@ from scapy.packet import Packet, bind_layers
 from scapy.fields import ByteField, LenField, IntField, ShortField, LongField, IntEnumField, PacketListField, IPField, XShortEnumField
 
 # Used for the different threads
-from threading import Thread, Event, Lock
+from threading import Thread, Event, Lock, current_thread
 
 # Used by the router controller to distribute packets to different fibers
 from queue import Queue
@@ -41,20 +41,23 @@ import p4runtime_lib.switch
 import sys
 
 # Used for type hints
-from typing import Dict
+from typing import Dict, List
 
 # Used for getting the subnet mask
 import ipaddress
 
-# Packet queues
+# Packet queues - global
 arp_queue = Queue()
 hello_queue = Queue()
 lsu_queue = Queue()
 
 # Used for adding multicast group for flooding
+# NAAMA TODO - might not be needed
 multicast_group_id = 1
 egress_ports = [1, 3]
 
+# The p4info helper used to add p4 table entries - global
+p4info_helper = p4runtime_lib.helper.P4InfoHelper('/home/p4/tutorials/exercises/p4pi/build/p4pi.p4.p4info.txt')
 
 #################################
 #---------- Constants ----------#
@@ -80,6 +83,8 @@ PWOSPF_HELLO_DEST = '224.0.0.5'
 
 # The type code of CPU metadata packets
 TYPE_CPU_METADATA = 0x080a
+
+# Type code for IPV4 packets
 TYPE_IPV4 = 0x0800
 
 # The broadcast MAC address
@@ -107,7 +112,7 @@ INVALID_SEQUENCE_NUM = 0
 VERSION_NUM = 2
 
 # Invalid router ID
-INVALID_ROUTER_ID = 0
+INVALID_routerID = 0
 
 # The constant and unused authentication type and authentication value for all network routers and packets
 AUTHENTICATION_TYPE = 0
@@ -132,7 +137,6 @@ def sniff(store=False, prn=None, lfilter=None, stop_event=None, refresh=.1, *arg
                 break
             sel = select([s], [], [], refresh)
             if s in sel[0]:
-                print("sniff: received packet")
                 # Receive data from socket as bytes object, MTU "infinite"
                 p = s.recv(MTU)
                 if p is None:
@@ -161,22 +165,22 @@ def sniff(store=False, prn=None, lfilter=None, stop_event=None, refresh=.1, *arg
 # This class defines a neighbor, which is in reality an interface of another router. The neighbor is defined by an IP
 # address (of the interface) and a router ID (of the router this interface belongs to)
 class Neighbor:
-    def __init__(self, router_id, ip_addr):
+    def __init__(self, routerID : int, ipAddr : str):
         # The router ID of the neighbor
-        self.router_id = router_id
+        self.routerID = routerID
 
         # The IP address of the neighbor
-        self.ip_addr = ip_addr
+        self.ipAddr = ipAddr
 
         # A counter for the uptime of the neighbor - it will be removed if it reaches 0
-        self.uptime_counter = AtomicCounter(initial = INITIAL_HELLOINT)
+        self.uptimeCounter = AtomicCounter(initial = INITIAL_HELLOINT)
 
 
 # This class defines a "topology neighbor", which is essentially the contents of an LSUad.
 class TopologyNeighbor:
-    def __init__(self, router_id, subnet, mask):
+    def __init__(self, routerID : int, subnet : str, mask : str):
         # The router ID of the neighbor router
-        self.router_id = router_id
+        self.routerID = routerID
 
         # The subnet of the link between the neighbor and the RouterNeighbor
         self.subnet = subnet
@@ -189,12 +193,12 @@ class TopologyNeighbor:
 # its links. The interface is defined by its IP address, its subnet mask, the interval for sending out HELLO packets to
 # all its neighbors (which in actuality is constant for the entire network), and its port number.
 class Interface:
-    def __init__(self, ip_addr, subnet_mask, helloint, port, neighbors = {}):
+    def __init__(self, ipAddr : str, subnetMask : str, helloint : int, port : int, neighbors : Dict[str,Neighbor] = {}):
         # The IP address of the interface
-        self.ip_addr = ip_addr
+        self.ipAddr = ipAddr
 
         # The subnet mask of the interface
-        self.subnet_mask = subnet_mask
+        self.subnetMask = subnetMask
 
         # Interval in seconds between HELLO messages
         self.helloint = helloint
@@ -208,30 +212,44 @@ class Interface:
         self.neighbors = neighbors
 
     # Function for adding a new neighbor to the interface's list
-    def add_neighbor(self, cntrl, neighbor_router_id, neighbor_ip, neighbor_mask):
-        new_neighbor = Neighbor(neighbor_router_id, neighbor_ip)
-        # Create a new neighbor instance and add it to interface's neighbor list
+    def add_neighbor(self, cntrl : RouterController, neighbor_routerID : int, neighbor_ip : str, neighbor_mask : str):
+        # Create the neighbor instance for the new neighbor
+        new_neighbor = Neighbor(neighbor_routerID, neighbor_ip)
+        # Add it to interface's neighbor list
+        print("Interface: Adding router", neighbor_routerID, "as neighbor for interface", self.ipAddr)
         self.neighbors[neighbor_ip] = new_neighbor
-        # Add this neighbor to the topology
-        cntrl.add_neighbor_to_topology(neighbor_router_id, (INVALID_SEQUENCE_NUM, {}))
-        # NAAMA TODO - maybe add to my own list in topology
+        # Add this router to the topology
+        cntrl.topology.add_router(neighbor_routerID, TopologyRouterInfo())
+        # Add to this router's neighbor dictionary in topology
         neighbor_subnet = ipaddress.IPv4Network(neighbor_ip + "/" + neighbor_mask, strict = False)
         neighbor_subnet = neighbor_subnet.network_address
-        new_topology_neighbor = TopologyNeighbor(neighbor_router_id, neighbor_subnet, neighbor_mask)
-        cntrl.add_neighbor_to_my_topology_neighbors(new_topology_neighbor)
+        new_topology_neighbor = TopologyNeighbor(neighbor_routerID, neighbor_subnet, neighbor_mask)
+        cntrl.topology.add_neighbor_to_router(cntrl.routerID, new_topology_neighbor)
 
     # Function for removing a neighbor from the interface's list
-    def remove_neighbor(self, cntrl, neighbor):
+    def remove_neighbor(self, cntrl : RouterController, neighbor : Neighbor):
+        print("Interface: Removing router", neighbor.routerID, "as neighbor for interface", self.ipAddr)
         # Remove the neighbor from this interface's dictionary
-        del self.neighbors[neighbor.ip_addr]
-        # Remove this neighbor from the topology
-        cntrl.remove_from_topology(neighbor.router_id)
-        cnrl.remove_neighbor_from_my_topology_neighbors(neighbor.router_id)
+        del self.neighbors[neighbor.ipAddr]
+        # Remove neighbor and all its entries from routing table, plus the subnet
+        # between this router and the removed neighbor
+        topology = cntrl.topology.get()
+        removed_router_neighbors = topology[neighbor.routerID].neighbors
+        for neighbor in removed_router_neighbors:
+            cntrl.delete_entry_routing_table(neighbor.subnet)
+        cntrl.delete_entry_routing_table(neighbor.ipAddr)
+        # Delete the subnet between this router and the removed router
+        removed_neighbor = topology[cntrl.routerID].neighbors[neighbor.routerID]
+        cntrl.delete_entry_routing_table[removed_neighbor.subnet]
+        cntrl.topology.set(topology)
+        # Remove this neighbor from the topology and from this router's topology neighbors
+        cntrl.topology.remove_router(neighbor.routerID)
+        cnrl.topology.remove_neighbor_from_router(cntrl.routerID, neighbor.routerID)
 
 
 # This class defines a locked counter that can be safely accessed from multiple threads
 class AtomicCounter:
-    def __init__(self, initial = 0):
+    def __init__(self, initial : int = 0):
         # The initial values of the counter
         self.value = initial
 
@@ -239,7 +257,7 @@ class AtomicCounter:
         self.lock = Lock()
 
     # This function decrements the value of the counter by the provided amount
-    def decrement(self, amount = 1):
+    def decrement(self, amount : int = 1):
         # Lock before accessing the counter
         with self.lock:
             # Decrease the value
@@ -249,7 +267,7 @@ class AtomicCounter:
         return self.value
 
     # This function sets the value of the counter to the provided new value
-    def set_value(self, new_value):
+    def set_value(self, new_value : int):
         # Lock before accessing the counter
         with self.lock:
             # Set the new value
@@ -258,6 +276,69 @@ class AtomicCounter:
         # Return the newly set value
         return self.value
 
+class TopologyRouterInfo:
+    def __init__(self,
+                 seq_num : int = INVALID_SEQUENCE_NUM,
+                 last_recv_lsu : int = time(),
+                 neighbors: Dict[int,TopologyNeighbor] = {}):
+        self.seq_num = seq_num
+        self.last_recv_lsu = last_recv_lsu
+        self.neighbors = neighbors
+
+# This class represents the topology as this router sees it, essentially an
+# adjency list of each router and its known neighbors
+class Topology:
+    def __init__(self, this_routerID : int):
+        # A dictionary with router ID as keys, and values of TopologyRouterInfo
+        self.topology = {this_routerID : TopologyRouterInfo()}
+
+        # A lock for accessing the topology
+        self.topology_lock = Lock()
+
+    # Function for getting the topology
+    def get(self) -> Topology:
+        with self.topology_lock:
+            return self.topology
+
+    # Function for adding a router to the topology
+    def add_router(self,
+                     new_key : int,
+                     new_value : TopologyRouterInfo):
+        print("topology: adding router", new_key)
+        with self.topology_lock:
+            self.topology[new_key] = new_value
+
+    # Function for removing a router from the topology
+    def remove_router(self, key_to_remove : int):
+        print("topology: removing router", key_to_remove)
+        with self.topology_lock:
+            del self.topology[key_to_remove]
+
+    # Function for adding a neighbor to a router's neighbors
+    def add_neighbor_to_router(self,
+                               routerID : int,
+                               topology_neighbor : TopologyNeighbor):
+        print("topology: adding neighbor", topology_neighbor.routerID, "to router ", routerID)
+        with self.topology_lock:
+            this_router_neighbors = self.topology[routerID].neighbors
+            this_router_neighbors[topology_neighbor.routerID] = topology_neighbor
+
+    # Function for removing a neighbor from a router's neighbors
+    def remove_neighbor_from_router(self,
+                                    routerID : int,
+                                    topology_neighbor_id : int):
+        print("topology: removing neighbor", topology_neighbor_id, "from router", routerID)
+        with self.topology_lock:
+            this_router_neighbors = self.topology[routerID].neighbors
+            del this_router_neighbors[topology_neighbor_id]
+
+    def update_router_seq_num_and_uptime(self,
+                                         routerID : int,
+                                         new_seq_num : int):
+        with self.topology_lock:
+            self.topology[routerID].seq_num = new_seq_num
+            self.topology[routerID].last_recv_lsu = time()
+
 
 ################################################
 #---------- Thread Class Definitions ----------#
@@ -265,7 +346,7 @@ class AtomicCounter:
 
 # This class defines a thread that handles incoming ARP packets
 class ARPManager(Thread):
-    def __init__(self, cntrl):
+    def __init__(self, cntrl : RouterController):
         # Call the Thread class initializer
         super(ARPManager, self).__init__()
 
@@ -273,11 +354,11 @@ class ARPManager(Thread):
         self.cntrl = cntrl
 
     # This function creates and adds an entry to the forwarding table
-    def add_forwarding_entry(self, dst_ip_addr, dst_mac_addr):
+    def add_forwarding_entry(self, dst_ipAddr : str, dst_mac_addr : str):
         # Create the table entry
-        table_entry = p4runtime_lib.helper.P4InfoHelper.buildTableEntry(
+        table_entry = p4info_helper.buildTableEntry(
             table_name = "MyEgress.forwarding_table",
-            match_fields = {"meta.next_hop_ip_add": (dst_ip_addr, 32)},
+            match_fields = {"meta.next_hop_ip_add": (dst_ipAddr, 32)},
             action_name = "MyEgress.set_dst_and_src_mac",
             action_params = {
                 "dst_mac": dst_mac_addr
@@ -285,7 +366,7 @@ class ARPManager(Thread):
         )
 
         # Write entry to table
-        p4runtime_lib.switch.SwitchConnection.WriteTableEntry(table_entry)
+        switch_connection.WriteTableEntry(table_entry)
 
     # This function defines the activity of the ARP manager - repeatedly consume packets from queue, and either create
     # a reply or add an entry to the ARP table
@@ -296,10 +377,11 @@ class ARPManager(Thread):
 
             # Check if packet is an ARP request
             if pkt[ARP].op == ARP_OP_REQ:
+                print("ARP manager: got ARP request from", pkt[ARP].psrc)
 
                 # Check if the destination IP matches the interface's IP
                 for interface in self.cntrl.interfaces:
-                    if pkt[IP].dst == interface.ip_addr:
+                    if pkt[ARP].pdst == interface.ipAddr:
                         # Build ARP reply
                         arp_reply_pkt = Ether(src = self.cntrl.MAC, dst = pkt[Ether].src) / ARP(
                             op = ARP_OP_REPLY,
@@ -309,22 +391,24 @@ class ARPManager(Thread):
                             pdst = pkt[ARP].psrc)
 
                         # Send out ARP reply
+                        print("ARP manager: sending ARP reply for IP", interface.ipAddr)
                         self.cntrl.send_pkt(arp_reply_pkt)
 
             # Check if packet is an ARP reply
             # TODO - I assume here that the dst MAC was checked in data plane and this is addressed to me
             elif pkt[ARP].op == ARP_OP_REPLY:
 
+                print("ARP manager: got ARP reply")
                 # Add the new information to the forwarding table
                 self.add_forwarding_entry(
-                    dst_ip_addr = pkt[ARP].psrc,
+                    dst_ipAddr = pkt[ARP].psrc,
                     dst_mac_addr = pkt[ARP].hwsrc
                 )
 
 
 # This class defines a thread that periodically sends out HELLO packets
 class HelloPacketSender(Thread):
-    def __init__(self, cntrl, helloint, event):
+    def __init__(self, cntrl : RouterController, helloint : int, event : Event):
         # Call the Thread class initializer
         super(HelloPacketSender, self).__init__()
 
@@ -347,15 +431,16 @@ class HelloPacketSender(Thread):
                 hello_pkt = Ether(src = self.cntrl.MAC,
                                   dst = BROADCAST_MAC_ADDR,
                                   type = TYPE_CPU_METADATA) / CPUMetadata(origEtherType = 0x0800) / IP(
-                                      src = interface.ip_addr,
+                                      src = interface.ipAddr,
                                       dst = PWOSPF_HELLO_DEST,
                                       proto = OSPF_PROT_NUM
-                                      ) / PWOSPF(type = HELLO_TYPE) / Hello(
-                                          networkMask = interface.subnet_mask,
+                                      ) / PWOSPF(type = HELLO_TYPE,
+                                                 routerId = self.cntrl.routerID) / Hello(
+                                          networkMask = interface.subnetMask,
                                           HelloInt = interface.helloint
                                           )
                 # Send out the pacekt
-                print("sending hello packet from", interface.ip_addr, "to port", interface.port)
+                print("Hello packet sender: sending HELLO packet from", interface.ipAddr, "to port", interface.port)
                 self.cntrl.send_pkt(hello_pkt)
 
             # Sleep for the helloint interval
@@ -366,7 +451,7 @@ class HelloPacketSender(Thread):
                 # Iterate over all interface neighbors
                 for neighbor in interface.neighbors.values():
                     # Decrement the uptime counter of the neighbor
-                    new_uptime_value = neighbor.uptime_counter.decrement(self.helloint)
+                    new_uptime_value = neighbor.uptimeCounter.decrement(self.helloint)
                     if new_uptime_value <= 0:
                         # Neighbor has timed out, remove it and send out LSU about it
                         interface.remove_neighbor(self.cntrl, neighbor)
@@ -376,7 +461,7 @@ class HelloPacketSender(Thread):
 
 # This class defines a thread that handles incoming HELLO packets
 class HelloManager(Thread):
-    def __init__(self, cntrl, event):
+    def __init__(self, cntrl : RouterController, event : Event):
         # Call the Thread class initializer
         super(HelloManager, self).__init__()
 
@@ -392,6 +477,7 @@ class HelloManager(Thread):
         hello_pkt_sender = HelloPacketSender(self.cntrl, HELLOINT_IN_SECS, self.event)
 
         # Start the HELLO packet sender thread
+        print("Hello manager: starting HELLO packet sender")
         hello_pkt_sender.start()
 
         while True:
@@ -400,15 +486,16 @@ class HelloManager(Thread):
             # Check packet validity
             bIsFromMe = False
             for interface in self.cntrl.interfaces:
-                if pkt[IP].src == interface.ip_addr:
+                if pkt[IP].src == interface.ipAddr:
                     bIsFromMe = True
                     break
 
             if bIsFromMe:
                 continue
 
+            print("Hello manager: received HELLO pkt from", pkt[IP].src, "from port", pkt[CPUMetadata].ingressPort)
             if self.cntrl.check_pwospf_pkt_validity(pkt) is False:
-                print("hello manager: received invalid hello (pwospf) packet")
+                print("Hello manager: received invalid HELLO (pwospf) packet")
                 # Packet is invalid, drop
                 continue
 
@@ -416,16 +503,16 @@ class HelloManager(Thread):
             ingress_interface = self.cntrl.get_ingress_interface(pkt)
 
             if self.cntrl.check_hello_pkt_validity(pkt, ingress_interface) is False:
-                print("hello manager: received invalid hello packet")
+                print("Hello manager: received invalid HELLO packet")
                 # Packet is invalid, drop
                 continue
 
             # Check if the interface already knows this neighbor
             neighbor = ingress_interface.neighbors.get(pkt[IP].src)
             if neighbor is not None:
-                print("hello manager: received hello packet from known neighbor", pkt[IP].src)
+                print(current_thread().name, "Hello manager: received HELLO packet from known neighbor", pkt[IP].src)
                 # Reset the neighbor's HELLO counter
-                neighbor.uptime_counter.set_value(INITIAL_HELLOINT)
+                neighbor.uptimeCounter.set_value(INITIAL_HELLOINT)
 
             else:
                 # If neighbor not found, add it
@@ -435,7 +522,7 @@ class HelloManager(Thread):
 
 # This class defines a thread the periodically sends out LSU packets
 class LsuPacketSender(Thread):
-    def __init__(self, cntrl, lsuint, event):
+    def __init__(self, cntrl : RouterController, lsuint : int, event : Event):
         # Call the Thread class initializer
         super(LsuPacketSender, self).__init__()
 
@@ -448,53 +535,10 @@ class LsuPacketSender(Thread):
         # Event to wait on for a change (adding/removing) in neighbors
         self.event = event
 
-    # This function defines the activity of the LSU packet sender - repeatedly sends out LSU packets out of all
-    # interfaces then sleeps for LSUint seconds, or until a change in topology occurres (the event is triggered)
-    def run(self):
-        while True:
-            # Send LSU packets to all neighbors
-            curr_seq_num = self.cntrl.get_lsu_seq()
-            ads = self.cntrl.get_lsu_ads()
-            # Iterate over the router's interfaces
-            for interface in self.cntrl.interfaces:
-                # Iterate over the interface's neighbors
-                for neighbor in interface.neighbors.values():
-                    # Create LSU packet
-                    lsu_pkt = Ether(src = self.cntrl.MAC,
-                                    dst = BROADCAST_MAC_ADDR) / IP(
-                                        src = interface.ip_addr,
-                                        dst = neighbor.ip_addr
-                                        ) / PWOSPF(type = LSU_TYPE) / LSU(
-                                            sequence = curr_seq_num,
-                                            numAds = len(ads),
-                                            LSUads = ads
-                                            )
-                    # Send out LSU packet
-                    print("lsu sender: sending lsu packet from", interface.ip_addr, "to port", interface.port)
-                    self.cntrl.send_pkt(lsu_pkt)
-
-            # Sleep for LSUint seconds or until there's a change in topology
-            self.event.wait(timeout = self.lsuint)
-
-
-# This class defines a thread that handles incoming LSU packets
-class LSUManager(Thread):
-    def __init__(self, cntrl, lsuint, event):
-        # Call the Thread class initializer
-        super(LSUManager, self).__init__()
-
-        # The router controller of this router
-        self.cntrl = cntrl
-
-        # This router's LSUint (is actually a constant for the entire network)
-        self.lsuint = lsuint
-
-        self.event = event
-
     # This function runs the djikstra algorithm on the network topology, and returns the predecessors - the "next hop"
     # for each router
-    def run_djikstra(self):
-        topology = self.cntrl.get_topology()
+    def run_djikstra(self)-> Tuple[Dict[str,int], Dict[int,int]]:
+        topology = self.cntrl.topology.get()
         # The currently unvisited nodes in the network
         unvisited_nodes = list(topology.keys())
         # The predecessors for each subnet
@@ -515,62 +559,59 @@ class LSUManager(Thread):
         # While the queue is not empty
         while nodes_heap:
             # Get the node with the current minimal distance
-            current_distance, current_router_id = heapq.heappop(nodes_heap)
+            current_distance, current_routerID = heapq.heappop(nodes_heap)
+            if current_routerID not in unvisited_nodes:
+                # Don't revisit a node
+                continue
             # Remove the current node from the unvisited nodes set
-            unvisited_nodes.pop(current_router_id)
+            unvisited_nodes.remove(current_routerID)
 
             # Iterate over the current router's neighbors
-            current_router_neighbors = topology[current_router_id][1]
+            current_router_neighbors = topology[current_routerID].neighbors
             for neighbor_id in current_router_neighbors.keys():
                 # Don't revisit a visited node
                 if neighbor_id not in unvisited_nodes:
                     continue
 
                 # Check if we found a shorter distance
-                if current_distance + 1 < distances[neighbor_id]:
+                new_distance = current_distance + 1
+                if new_distance < distances[neighbor_id]:
                     # Update the neighbor's minimal distance
-                    distances[neighbor_id] = current_distance + 1
+                    distances[neighbor_id] = new_distance
                     # Update the neighbor's distance in the heap
                     # TODO - make sure I don't get duplicates
-                    heapq.heappush(nodes_heap, (current_distance + 1, neighbor_id))
+                    heapq.heappush(nodes_heap, (new_distance, neighbor_id))
                     # Update the router's predecessor
-                    router_predecessors[neighbor_id] = current_router_id
+                    router_predecessors[neighbor_id] = current_routerID
 
 
             # Update the neighbor's subnets predecessor
-            current_node_neighbors = topology[current_router_id][1]
-            for neighbor in current_node_neighbors.values():
+            for neighbor in current_router_neighbors.values():
                 subnet = neighbor.subnet
                 if subnet not in subnet_predecessors:
-                    subnet_predecessors[subnet] = router_predecessors[current_router_id]
+                    subnet_predecessors[subnet] = router_predecessors[current_routerID]
 
         # Return the predecessors of all routers
         return subnet_predecessors, router_predecessors
 
     # This function creates and adds an entry to the routing table
-    def fill_routing_table(self, topology, subnet_predecessors, router_predecessors):
+    def fill_routing_table(self,
+                           topology: Topology,
+                           subnet_predecessors : Dict[str,int],
+                           router_predecessors : Dict[int,int]):
         # Fill a set with the router IDs of all neighbors
         neighbor_routers = {}
         for interface in self.cntrl.interfaces:
             for neighbor in interface.neighbors.values():
-                neighbor_routers[neighbor.router_id] = (interface.ip_addr, interface.port)
+                neighbor_routers[neighbor.routerID] = (interface.ipAddr, interface.port)
 
         # First, add this neighbors routers
         # NAAMA TODO - is this necessary?
-        this_routers_neighbors = topology[self.cntrl.routerID][1]
+        this_routers_neighbors = topology[self.cntrl.routerID].neighbors
         for neighbor in this_routers_neighbors.values():
-            table_entry = p4runtime_lib.helper.P4InfoHelper.buildTableEntry(
-                table_name = "MyIngress.routing_table",
-                match_fields = {"hdr.ipv4.dstAddr": (neighbor.subnet)},
-                action_name = "MyIngress.ipv4_forward",
-                action_params = {
-                    "next_hop": neighbor_routers[neighbor.router_id][0],
-                    "port": neighbor_routers[neighbor.router_id][1]
-                }
-            )
-
-            # Write entry to table
-            p4runtime_lib.switch.SwitchConnection.WriteTableEntry(table_entry)
+            self.cntrl.add_entry_routing_table(neighbor.subnet,
+                                               neighbor_routers[neighbor.routerID][0],
+                                               neighbor_routers[neighbor.routerID][1])
 
         # TODO - make sure we don't get duplicate entries
         # Now add the rest of the routers and their subnets that aren't routers
@@ -582,20 +623,71 @@ class LSUManager(Thread):
             while pred_router not in neighbor_routers.keys():
                 pred_router = router_predecessors[pred_router]
 
-            table_entry = p4runtime_lib.helper.P4InfoHelper.buildTableEntry(
-                table_name = "MyIngress.routing_table",
-                match_fields = {"hdr.ipv4.dstAddr": (subnet)},
-                action_name = "MyIngress.ipv4_forward",
-                action_params = {
-                    "next_hop": neighbor_routers[pred_router][0],
-                    "port": neighbor_routers[pred_router][1]
-                }
-            )
+            self.cntrl.add_entry_routing_table(subnet,
+                                               neighbor_routers[pred_router][0],
+                                               neighbor_routers[pred_router][1])
 
-            # Write entry to table
-            p4runtime_lib.switch.SwitchConnection.WriteTableEntry(table_entry)
+    # This function defines the activity of the LSU packet sender - repeatedly sends out LSU packets out of all
+    # interfaces then sleeps for LSUint seconds, or until a change in topology occurres (the event is triggered)
+    def run(self):
+        self.event.clear()
+        while True:
+            if self.event.is_set:
+                # We woke up because of a topology change, run run_djikstra
+                print("LSU packet sender: running djikstra")
+                subnet_predecessors, router_predecessors = self.run_djikstra()
+                self.fill_routing_table(self.cntrl.topology.get(),
+                                        subnet_predecessors,
+                                        router_predecessors)
+                self.event.clear()
+
+            # Check if there are outdated neighbors in topology
+            topology = self.cntrl.topology.get()
+            curr_time = time()
+            for routerID, router_info in topology.items():
+                if curr_time - router_info.last_recv_lsu > LSU_TIMEOUT:
+                    # Router timed out, remove from topology
+                    self.cntrl.topology.remove_router(routerID)
+
+            # Send LSU packets to all neighbors
+            curr_seq_num = self.cntrl.get_lsu_seq()
+            ads = self.cntrl.get_lsu_ads()
+            # Iterate over the router's interfaces
+            for interface in self.cntrl.interfaces:
+                # Iterate over the interface's neighbors
+                for neighbor in interface.neighbors.values():
+                    # Create LSU packet
+                    lsu_pkt = Ether(src = self.cntrl.MAC,
+                                    dst = BROADCAST_MAC_ADDR) / IP(
+                                        src = interface.ipAddr,
+                                        dst = neighbor.ipAddr
+                                        ) / PWOSPF(type = LSU_TYPE,
+                                                   routerId = self.cntrl.routerID) / LSU(
+                                            sequence = curr_seq_num,
+                                            numAds = len(ads),
+                                            LSUads = ads
+                                            )
+                    # Send out LSU packet
+                    print("LSU packet sender: sending lsu packet from", interface.ipAddr, "to port", interface.port)
+                    self.cntrl.send_pkt(lsu_pkt)
+
+            # Sleep for LSUint seconds or until there's a change in topology
+            self.event.wait(timeout = self.lsuint)
 
 
+# This class defines a thread that handles incoming LSU packets
+class LSUManager(Thread):
+    def __init__(self, cntrl : RouterController, lsuint : int, event : Event):
+        # Call the Thread class initializer
+        super(LSUManager, self).__init__()
+
+        # The router controller of this router
+        self.cntrl = cntrl
+
+        # This router's LSUint (is actually a constant for the entire network)
+        self.lsuint = lsuint
+
+        self.event = event
 
     # This function defines the activity of the LSU manager - repeatedly consume packets from queue and handle them
     def run(self):
@@ -603,38 +695,44 @@ class LSUManager(Thread):
         lsu_pkt_sender = LsuPacketSender(self.cntrl, self.lsuint, self.event)
 
         # Start the LSU packet sender thread
+        print("LSU manager: starting LSU packet sender")
         lsu_pkt_sender.start()
 
         while True:
             # Consume packets from queue
             pkt = lsu_queue.get()
-            print("lsu manager: got lsu packet from", pkt[IP].src)
+
             # Check packet validity
             if self.cntrl.check_pwospf_pkt_validity(pkt) is False:
                 # Packet is invalid, drop
+                print("LSU manager: invalid lsu packet from", pkt[IP].src)
                 continue
             should_run_djikstra = False
 
             # Get the router ID of the sender
-            src_router_id = pkt[PWOSPF].routerId
+            src_routerID = pkt[PWOSPF].routerId
 
             # If the packet came from this router - do nothing
-            if src_router_id == self.cntrl.routerID:
+            if src_routerID == self.cntrl.routerID:
                 continue
 
+            print("LSU manager: got lsu packet from", pkt[IP].src)
             # Get the source router instance (if its existance in the network is known)
-            topology = self.cntrl.get_topology()
-            router_info = topology.get(src_router_id)
+            topology = self.cntrl.topology.get()
+            router_info = topology.get(src_routerID)
             if router_info is None:
                 # First time we hear of this router, add it
-                topology[src_router_id] = (INVALID_SEQUENCE_NUM, {})
-                router_info = topology[src_router_id]
+                # NAAMA TODO - what about unknown neighbors?
+                self.cntrl.topology.add_router(src_routerID, TopologyRouterInfo())
+                topology = self.cntrl.topology.get()
+                router_info = topology[src_routerID]
 
-            curr_seq_num = router_info[0]
-            src_router_neighbors = router_info[1]
+            curr_seq_num = router_info.seq_num
+            src_router_neighbors = router_info.neighbors
 
             # Check if this LSU was already received
             if curr_seq_num == pkt[LSU].sequence:
+                print("LSU manager: got duplicate LSU packet, dropping")
                 continue
 
             # Initialize an empty set for existing topology neighbors for the source router
@@ -647,9 +745,10 @@ class LSUManager(Thread):
                 # NAAMA TODO - conflicting updates?
                 if topology_neighbor is None:
                     # New neighbor, add it
-                    src_router_neighbors[LSUad.routerId] = TopologyNeighbor(LSUad.routerId,
-                                                                            LSUad.subnet,
-                                                                            LSUad.mask)
+                    new_neighbor = TopologyNeighbor(LSUad.routerId,
+                                                    LSUad.subnet,
+                                                    LSUad.mask)
+                    self.cntrl.topology.add_neighbor_to_router(src_routerID, new_neighbor)
                     # A change was made to the topology, should run djikstra
                     should_run_djikstra = True
 
@@ -659,42 +758,50 @@ class LSUManager(Thread):
             # Iterate over the source router topology neighbors
             for topology_neighbor in src_router_neighbors.values():
                 # If the neighbor was found in the LSU packet
-                if topology_neighbor.router_id not in found_neighbors_ids:
+                if topology_neighbor.routerID not in found_neighbors_ids:
                         # Neighbor expired, remove it
-                        del src_router_neighbors[topology_neighbor.router_id]
+                        self.cntrl.topology.remove_neighbor_from_router(src_routerID, topology_neighbor.routerID)
+                        # Remove the entry for this subnet from the routing table_entry
+                        self.cntrl.delete_entry_routing_table(topology_neighbor.subnet)
                         # A change was made to the topology, should run djikstra
                         should_run_djikstra = True
 
-            # Update sender with new sequence number and neighbors
-            topology[src_router_id] = (pkt[LSU].sequence,src_router_neighbors)
-            self.cntrl.set_topology(topology)
+            # Update sender with new sequence number and uptime
+            self.cntrl.topology.update_router_seq_num_and_uptime(src_routerID, pkt[LSU].sequence)
 
             if should_run_djikstra:
-                # Run the djikstra algorithm on the new topology
-                subnet_predecessors, router_predecessors = self.run_djikstra()
-                # Fill the routing table with updates entries
-                self.fill_routing_table(topology, subnet_predecessors, router_predecessors)
-                self.cntrl.set_topology(topology)
+                print("LSU manager: running djikstra")
+                # LSU packet sender will run djikstra, fill routing table and send new LSU
+                self.event.set()
 
             # Flood the packet to all neighbors except for incoming interface
             pkt[LSU].TTL = pkt[LSU].TTL - 1
+            print("LSU manager: TTL of pkt", pkt[LSU].TTL)
             if pkt[LSU].TTL <= 0:
                 continue
             ingress_interface = self.cntrl.get_ingress_interface(pkt)
             for interface in self.cntrl.interfaces:
-                if interface.ip_addr == ingress_interface.ip_addr:
+                if interface.ipAddr == ingress_interface.ipAddr:
                     # Don't flood to ingress interface
                     continue
                 pkt[Ether].src = self.cntrl.MAC
                 for neighbor in interface.neighbors:
-                    pkt[IP].dst = neighbor.ip_addr
+                    print("LSU manager: flooding LSU pkt to", neighbor.ipAddr)
+                    pkt[IP].dst = neighbor.ipAddr
                     # Send out LSU packet
                     self.cntrl.send_pkt(pkt)
 
 
 # This class defines a thread that controlls the router
 class RouterController(Thread):
-    def __init__(self, sw, routerID, MAC, areaID, interfaces, lsuint=2, start_wait=0.3):
+    def __init__(self,
+                 sw : str,
+                 routerID : int,
+                 MAC : str,
+                 areaID : int,
+                 interfaces : List[Interface],
+                 lsuint : int = 2,
+                 start_wait : float = 0.3):
         # Call the Thread class initializer
         super(RouterController, self).__init__()
 
@@ -737,60 +844,52 @@ class RouterController(Thread):
         # The controller's LSU manager thread
         self.lsu_manager = LSUManager(self, self.lsuint, self.topology_change_event)
 
-        # Lock for accessing the topology - shared resource
-        self.topology_lock = Lock()
-
         # An adjency list describing the network topology - a dictionary of
         # routers (key is neighbor (router) ID, value is a tuple of sequence
         # number and a dictionary of TopologyNeighbor instances as values, with
         # router ID keys)
-        self.topology = {self.routerID : (INVALID_SEQUENCE_NUM, {})}
+        self.topology = Topology(self.routerID)
 
-    def get_topology(self):
-        with self.topology_lock:
-            return self.topology
+    def add_entry_routing_table(self, dstAddr : str, next_hop : int, port : int):
+        print("Controller: adding entry for addr", dstAddr)
+        table_entry = p4info_helper.buildTableEntry(
+        table_name = "MyIngress.routing_table",
+        match_fields = {"hdr.ipv4.dstAddr": (str(dstAddr), 32)},
+        action_name = "MyIngress.ipv4_forward",
+        action_params = {
+            "next_hop": next_hop,
+            "port": port
+            }
+        )
 
-    def set_topology(self, new_topology):
-        with self.topology_lock:
-            self.topology = new_topology
+        # Write entry to table
+        #switch_connection.WriteTableEntry(table_entry)
 
-    def add_neighbor_to_topology(self, new_key, new_value):
-        with self.topology_lock:
-            self.topology[new_key] = new_value
+    def delete_entry_routing_table(self, dstAddr : str):
+        print("Controller: deleting entry for addr", dstAddr)
+        table_entry = p4info_helper.buildTableEntry(
+            table_name = "MyIngress.routing_table",
+            match_fields = {"hdr.ipv4.dstAddr": (dstAddr)},
+            action_name = None
+        )
 
-    def remove_from_topology(self, key_to_remove):
-        with self.topology_lock:
-            del self.topology[key_to_remove]
-
-    def add_neighbor_to_my_topology_neighbors(self, topology_neighbor):
-        with self.topology_lock:
-            this_router_neighbors = self.topology[self.routerID][1]
-            this_router_neighbors[topology_neighbor.router_id] = topology_neighbor
-
-    def remove_neighbor_from_my_topology_neighbors(self, topology_neighbor_id):
-        with self.topology_lock:
-            this_router_neighbors = self.topology[self.routerID][1]
-            del this_router_neighbors[topology_neighbor_id]
+        # Write entry to table
+        #switch_connection.DeleteTableEntry(table_entry)
 
     # This function sends an incoming packet to the appropriate queue
     def process_pkt(self, pkt):
         if ARP in pkt:
-            print("controller: received arp packet")
             # ARP packet
             arp_queue.put(pkt)
         elif Hello in pkt:
-            print("controller: received hello packet")
             # HELLO packet
             hello_queue.put(pkt)
         elif LSU in pkt:
-            print("controller: received lsu packet")
             # LSU packet
             lsu_queue.put(pkt)
-        else:
-            print("controller: received unknown packet")
 
     # Getting the ingress interface of a packet
-    def get_ingress_interface(self, pkt):
+    def get_ingress_interface(self, pkt) -> Interface:
         ingress_port = pkt[CPUMetadata].ingressPort
         for interface in self.interfaces:
             if interface.port == ingress_port:
@@ -800,7 +899,7 @@ class RouterController(Thread):
         return None
 
     # This function checks the validity of an incoming PWOSPF packet
-    def check_pwospf_pkt_validity(self, pkt):
+    def check_pwospf_pkt_validity(self, pkt) -> bool:
         if pkt[PWOSPF].version != VERSION_NUM:
             return False
         # TODO - check checksum
@@ -814,8 +913,8 @@ class RouterController(Thread):
         return True
 
     # This function checks the validity of an incoming HELLO packet
-    def check_hello_pkt_validity(self, pkt, ingress_interface):
-        if pkt[Hello].networkMask != ingress_interface.subnet_mask:
+    def check_hello_pkt_validity(self, pkt, ingress_interface) -> bool:
+        if pkt[Hello].networkMask != ingress_interface.subnetMask:
             return False
         if pkt[Hello].HelloInt != ingress_interface.helloint:
             return False
@@ -823,7 +922,6 @@ class RouterController(Thread):
 
     # This function sends a packet to the data plane
     def send_pkt(self, pkt):
-        print("sending packet to interface", self.sw)
         sendp(pkt, iface = self.sw)
 
     # This function gets an LSU sequence number for a packet
@@ -836,14 +934,11 @@ class RouterController(Thread):
     # This function returns the LSUads for outgoing LSU packets
     def get_lsu_ads(self):
         ads = []
-        for interface in self.interfaces:
-            neighbors = interface.neighbors
-            for neighbor in neighbors.values():
-                neighbor_subnet = ipaddress.IPv4Network(neighbor.ip_addr + "/" + interface.subnet_mask, strict = False)
-                neighbor_subnet = neighbor_subnet.network_address
-                ads.append(LSUad(subnet = neighbor_subnet,
-                                 mask = interface.subnet_mask,
-                                 routerId = neighbor.router_id))
+        my_neighbors = self.topology.get()[self.routerID].neighbors
+        for neighbor in my_neighbors.values():
+            ads.append(LSUad(subnet = neighbor.subnet,
+                             mask = neighbor.mask,
+                             routerId = neighbor.routerID))
         return ads
 
     def print_packet_layers(self, pkt):
@@ -852,19 +947,29 @@ class RouterController(Thread):
             layer.show()
             layer = layer.payload
 
-    def init_multicast_group(self):
-        p4runtime_lib.helper.P4InfoHelper.buildMulticastGroupEntry(multicast_group_id, egress_ports)
+    def init_switch_connection(self):
+        switch_connection = p4runtime_lib.switch.SwitchConnection(name='s'+str(self.routerID),
+        address=('127.0.0.1:5005'+str(self.routerID)),
+        device_id=self.routerID - 1,
+        proto_dump_file='logs/s'+str(self.routerID)+'-p4runtime-requests.txt')
+        switch_connection.MasterArbitrationUpdate()
 
     # This function defines the activity of the router controller - repeatedly sniffs for packets and distributed them
     # to the appropriate thread
     def run(self):
+        # Init and start grpc switch connection
+        #self.init_switch_connection()
+
         # Start ARP manager
+        print("Controller: Starting ARP manager")
         self.arp_manager.start()
 
         # Start HELLO manager
+        print("Controller: Starting HELLO manager")
         self.hello_manager.start()
 
         # Start LSU manager
+        print("Controller: Starting LSU manager")
         self.lsu_manager.start()
 
         return sniff(store = False, prn = self.process_pkt, stop_event = self.stop_event, refresh = 0.1)
@@ -968,14 +1073,14 @@ if __name__ == "__main__":
         print("starting router 1")
         interfaces = [
             Interface(
-                ip_addr = "10.0.2.2",
-                subnet_mask = "255.255.255.0",
+                ipAddr = "10.0.2.2",
+                subnetMask = "255.255.255.0",
                 helloint = HELLOINT_IN_SECS,
                 port = 1
             ),
             Interface(
-                ip_addr = "10.0.2.2",
-                subnet_mask = "255.255.255.0",
+                ipAddr = "10.0.2.2",
+                subnetMask = "255.255.255.0",
                 helloint = HELLOINT_IN_SECS,
                 port = 3
             )
@@ -994,14 +1099,14 @@ if __name__ == "__main__":
         print("starting router 2")
         interfaces = [
             Interface(
-                ip_addr = "10.0.3.3",
-                subnet_mask = "255.255.255.0",
+                ipAddr = "10.0.3.3",
+                subnetMask = "255.255.255.0",
                 helloint = HELLOINT_IN_SECS,
                 port = 1
             ),
             Interface(
-                ip_addr = "10.0.3.3",
-                subnet_mask = "255.255.255.0",
+                ipAddr = "10.0.3.3",
+                subnetMask = "255.255.255.0",
                 helloint = HELLOINT_IN_SECS,
                 port = 3
             )
