@@ -57,7 +57,7 @@ multicast_group_id = 1
 egress_ports = [1, 3]
 
 # The p4info helper used to add p4 table entries - global
-p4info_helper = p4runtime_lib.helper.P4InfoHelper('/home/p4/tutorials/exercises/p4pi/build/p4pi.p4.p4info.txt')
+p4info_helper = p4runtime_lib.helper.P4InfoHelper('C:/Users/User/Documents/Semester6_CS/Project_in_Communication_Networks/p4pi_common/p4pi_project/control-plane/p4pi.p4.p4info.txt')
 
 #################################
 #---------- Constants ----------#
