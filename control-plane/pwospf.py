@@ -356,9 +356,10 @@ class ARPManager(Thread):
     # This function creates and adds an entry to the forwarding table
     def add_forwarding_entry(self, dst_ipAddr : str, dst_mac_addr : str):
         # Create the table entry
+        print("Adding forwarding entry for IP", dst_ipAddr, "MAC", dst_mac_addr)
         table_entry = p4info_helper.buildTableEntry(
             table_name = "MyEgress.forwarding_table",
-            match_fields = {"meta.next_hop_ip_add": (dst_ipAddr, 32)},
+            match_fields = {"meta.next_hop_ip_add": (dst_ipAddr)},
             action_name = "MyEgress.set_dst_and_src_mac",
             action_params = {
                 "dst_mac": dst_mac_addr
@@ -366,7 +367,7 @@ class ARPManager(Thread):
         )
 
         # Write entry to table
-        switch_connection.WriteTableEntry(table_entry)
+        self.cntrl.switch_connection.WriteTableEntry(table_entry)
 
     # This function defines the activity of the ARP manager - repeatedly consume packets from queue, and either create
     # a reply or add an entry to the ARP table
@@ -645,6 +646,8 @@ class LsuPacketSender(Thread):
             topology = self.cntrl.topology.get()
             curr_time = time()
             for routerID, router_info in topology.items():
+                if routerID == self.cntrl.routerID:
+                    continue
                 if curr_time - router_info.last_recv_lsu > LSU_TIMEOUT:
                     # Router timed out, remove from topology
                     self.cntrl.topology.remove_router(routerID)
@@ -850,6 +853,8 @@ class RouterController(Thread):
         # router ID keys)
         self.topology = Topology(self.routerID)
 
+        self.switch_connection = None
+
     def add_entry_routing_table(self, dstAddr : str, next_hop : int, port : int):
         print("Controller: adding entry for addr", dstAddr)
         table_entry = p4info_helper.buildTableEntry(
@@ -863,7 +868,7 @@ class RouterController(Thread):
         )
 
         # Write entry to table
-        #switch_connection.WriteTableEntry(table_entry)
+        self.switch_connection.WriteTableEntry(table_entry)
 
     def delete_entry_routing_table(self, dstAddr : str):
         print("Controller: deleting entry for addr", dstAddr)
@@ -948,17 +953,18 @@ class RouterController(Thread):
             layer = layer.payload
 
     def init_switch_connection(self):
-        switch_connection = p4runtime_lib.switch.SwitchConnection(name='s'+str(self.routerID),
-        address=('127.0.0.1:5005'+str(self.routerID)),
-        device_id=self.routerID - 1,
-        proto_dump_file='logs/s'+str(self.routerID)+'-p4runtime-requests.txt')
-        switch_connection.MasterArbitrationUpdate()
+        self.switch_connection = p4runtime_lib.switch.SwitchConnection(name='s'+str(self.routerID),
+        address=('192.168.4.1:50051'),
+        device_id=self.routerID)
+        self.switch_connection.MasterArbitrationUpdate()
+        self.switch_connection.SetForwardingPipelineConfig(p4info=p4info_helper.p4info)
 
     # This function defines the activity of the router controller - repeatedly sniffs for packets and distributed them
     # to the appropriate thread
     def run(self):
         # Init and start grpc switch connection
-        #self.init_switch_connection()
+        self.init_switch_connection()
+        print("successfully connected to switch")
 
         # Start ARP manager
         print("Controller: Starting ARP manager")
