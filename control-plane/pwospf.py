@@ -6,6 +6,7 @@
 
 # Used for type hints
 from __future__ import annotations
+from typing import Dict, List
 
 # Used in sniff()
 from select import select
@@ -17,7 +18,7 @@ from scapy.all import conf, ETH_P_ALL, MTU, PacketList, Packet, Ether, IP, ARP, 
 from scapy.packet import Packet, bind_layers
 
 # Used to parse the different fields in each header in the packet
-from scapy.fields import ByteField, LenField, IntField, ShortField, LongField, IntEnumField, PacketListField, IPField, XShortEnumField
+from scapy.fields import ByteField, LenField, IntField, ShortField, LongField, PacketListField, IPField, XShortEnumField
 
 # Used for the different threads
 from threading import Thread, Event, Lock, current_thread
@@ -40,9 +41,6 @@ import p4runtime_lib.switch
 # Used for reading command line arguments
 import sys
 
-# Used for type hints
-from typing import Dict, List
-
 # Used for getting the subnet mask
 import ipaddress
 
@@ -54,10 +52,10 @@ lsu_queue = Queue()
 # Used for adding multicast group for flooding
 # NAAMA TODO - might not be needed
 multicast_group_id = 1
-egress_ports = [1, 3]
+egress_ports = [0, 1]
 
 # The p4info helper used to add p4 table entries - global
-p4info_helper = p4runtime_lib.helper.P4InfoHelper('C:/Users/User/Documents/Semester6_CS/Project_in_Communication_Networks/p4pi_common/p4pi_project/control-plane/p4pi.p4.p4info.txt')
+p4info_helper = p4runtime_lib.helper.P4InfoHelper('/root/bmv2/bin/router.p4info.txt')
 
 #################################
 #---------- Constants ----------#
@@ -121,6 +119,15 @@ AUTHENTICATION_VALUE = 0
 # Initial TTL
 INITIAL_TTL = 255
 
+# The interface used for communication between the data plane and the control plane
+DATA_PLANE_IFACE = "veth0"
+
+# The data plane's forwarding table name
+FORWARDING_TABLE_NAME = "MyEgress.forwarding_table"
+
+# The data plane's routing table name
+ROUTING_TABLE_NAME = "MyIngress.routing_table"
+
 
 ########################################
 #---------- Sniff() function ----------#
@@ -129,7 +136,7 @@ INITIAL_TTL = 255
 # This function "sniffs" the socket for packets
 def sniff(store=False, prn=None, lfilter=None, stop_event=None, refresh=.1, *args, **kwargs):
     # Listen for packets
-    s = conf.L2listen(type=ETH_P_ALL, *args, **kwargs)
+    s = conf.L2listen(type=ETH_P_ALL, iface = DATA_PLANE_IFACE, *args, **kwargs)
     lst = []
     try:
         while True:
@@ -244,7 +251,7 @@ class Interface:
         cntrl.topology.set(topology)
         # Remove this neighbor from the topology and from this router's topology neighbors
         cntrl.topology.remove_router(neighbor.routerID)
-        cnrl.topology.remove_neighbor_from_router(cntrl.routerID, neighbor.routerID)
+        cntrl.topology.remove_neighbor_from_router(cntrl.routerID, neighbor.routerID)
 
 
 # This class defines a locked counter that can be safely accessed from multiple threads
@@ -355,10 +362,15 @@ class ARPManager(Thread):
 
     # This function creates and adds an entry to the forwarding table
     def add_forwarding_entry(self, dst_ipAddr : str, dst_mac_addr : str):
+        # Make sure this entry doesn't already exist in the table
+        forwarding_table_id = p4info_helper.get_id("tables", FORWARDING_TABLE_NAME)
+        if self.cntrl.entry_already_exists(forwarding_table_id, dst_ipAddr):
+            return
+        
         # Create the table entry
         print("Adding forwarding entry for IP", dst_ipAddr, "MAC", dst_mac_addr)
         table_entry = p4info_helper.buildTableEntry(
-            table_name = "MyEgress.forwarding_table",
+            table_name = FORWARDING_TABLE_NAME,
             match_fields = {"meta.next_hop_ip_add": (dst_ipAddr)},
             action_name = "MyEgress.set_dst_and_src_mac",
             action_params = {
@@ -431,7 +443,7 @@ class HelloPacketSender(Thread):
                 # Create the HELLO packet
                 hello_pkt = Ether(src = self.cntrl.MAC,
                                   dst = BROADCAST_MAC_ADDR,
-                                  type = TYPE_CPU_METADATA) / CPUMetadata(origEtherType = 0x0800) / IP(
+                                  type = TYPE_CPU_METADATA) / CPUMetadata(origEtherType = 0x0800, egressPort = interface.port) / IP(
                                       src = interface.ipAddr,
                                       dst = PWOSPF_HELLO_DEST,
                                       proto = OSPF_PROT_NUM
@@ -856,6 +868,11 @@ class RouterController(Thread):
         self.switch_connection = None
 
     def add_entry_routing_table(self, dstAddr : str, next_hop : int, port : int):
+        # Make sure this entry doesn't already exist in the table
+        routing_table_id = p4info_helper.get_id("tables", ROUTING_TABLE_NAME)
+        if self.entry_already_exists(routing_table_id, dstAddr, 32):
+            return
+
         print("Controller: adding entry for addr", dstAddr)
         table_entry = p4info_helper.buildTableEntry(
         table_name = "MyIngress.routing_table",
@@ -879,7 +896,13 @@ class RouterController(Thread):
         )
 
         # Write entry to table
-        #switch_connection.DeleteTableEntry(table_entry)
+        self.switch_connection.DeleteTableEntry(table_entry)
+
+    def entry_already_exists(self, table_id, *args):
+        for entry in self.switch_connection.ReadTableEntries(table_id):
+            if entry.match == args:
+                return True
+        return False
 
     # This function sends an incoming packet to the appropriate queue
     def process_pkt(self, pkt):
@@ -953,9 +976,9 @@ class RouterController(Thread):
             layer = layer.payload
 
     def init_switch_connection(self):
-        self.switch_connection = p4runtime_lib.switch.SwitchConnection(name='s'+str(self.routerID),
-        address=('192.168.4.1:50051'),
-        device_id=self.routerID)
+        self.switch_connection = p4runtime_lib.switch.SwitchConnection(name='s1',
+        address=('127.0.0.1:50051'),
+        device_id=0)
         self.switch_connection.MasterArbitrationUpdate()
         self.switch_connection.SetForwardingPipelineConfig(p4info=p4info_helper.p4info)
 
@@ -991,7 +1014,8 @@ class CPUMetadata(Packet):
     fields_desc = [
         XShortEnumField("origEtherType", 0x0800, {0x0800: "IP", 0x0806: "ARP"}),
         # Packet ingress port
-        ShortField("ingressPort", 0)
+        ShortField("ingressPort", 0),
+        ShortField("egressPort", 0)
     ]
 
 
@@ -1118,7 +1142,7 @@ if __name__ == "__main__":
             )
         ]
         router_controller = RouterController(
-            sw = "eth0",
+            sw = "veth0",
             routerID = 2,
             MAC = "08:00:00:00:03:33",
             areaID = AREA_ID,

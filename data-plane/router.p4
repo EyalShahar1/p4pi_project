@@ -34,8 +34,10 @@ header ethernet_t {
 // CPU header
 header cpu_t {
     bit<16>     etherType;
-    bit<7>      padding;
+    bit<7>      ingress_padding;
     port_t      ingress_port;
+    bit<7>      egress_padding;
+    port_t      egress_port;
 }
 
 // ARP header
@@ -176,7 +178,8 @@ control MyIngress(inout headers hdr,
     }
 
     action flood() {
-        standard_metadata.mcast_grp = MULTICAST_GRP;
+        //standard_metadata.mcast_grp = MULTICAST_GRP;
+        standard_metadata.egress_spec = hdr.cpu.egress_port;
         hdr.ethernet.etherType = hdr.cpu.etherType;
         meta.next_hop_ip_add = hdr.ipv4.dstAddr;
     }
