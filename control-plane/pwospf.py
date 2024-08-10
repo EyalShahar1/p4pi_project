@@ -44,6 +44,8 @@ import sys
 # Used for getting the subnet mask
 import ipaddress
 
+import socket
+
 # Packet queues - global
 arp_queue = Queue()
 hello_queue = Queue()
@@ -127,6 +129,16 @@ FORWARDING_TABLE_NAME = "MyEgress.forwarding_table"
 
 # The data plane's routing table name
 ROUTING_TABLE_NAME = "MyIngress.routing_table"
+
+# Host IP and MAC addresses
+HOST_1_IP =  '169.254.1.1'
+HOST_1_MAC = 'd8:cb:8a:06:47:70'
+HOST_1_SUBNET = '169.254.1.0'
+HOST_1_MASK = '255.255.255.0'
+HOST_2_IP =  '169.254.2.1'
+HOST_2_MAC = '5c:f9:dd:6c:5e:88'
+HOST_2_SUBNET = '169.254.2.0'
+HOST_2_MASK = '255.255.255.0'
 
 
 ########################################
@@ -241,7 +253,7 @@ class Interface:
         # Remove neighbor and all its entries from routing table, plus the subnet
         # between this router and the removed neighbor
         topology = cntrl.topology.get()
-        removed_router_neighbors = topology[neighbor.routerID].neighbors
+        removed_router_neighbors = topology[neighbor.routerID].neighbors.values()
         for neighbor in removed_router_neighbors:
             cntrl.delete_entry_routing_table(neighbor.subnet)
         cntrl.delete_entry_routing_table(neighbor.ipAddr)
@@ -361,22 +373,32 @@ class ARPManager(Thread):
         self.cntrl = cntrl
 
     # This function creates and adds an entry to the forwarding table
-    def add_forwarding_entry(self, dst_ipAddr : str, dst_mac_addr : str):
+    def add_forwarding_entry(self, action : str, dst_ipAddr : str, dst_mac_addr : str = ''):
         # Make sure this entry doesn't already exist in the table
         forwarding_table_id = p4info_helper.get_id("tables", FORWARDING_TABLE_NAME)
-        if self.cntrl.entry_already_exists(forwarding_table_id, dst_ipAddr):
+        if self.cntrl.entry_already_exists(FORWARDING_TABLE_NAME, forwarding_table_id, dst_ipAddr):
+            print("forwarding entry for", dst_ipAddr, "already exists")
             return
         
         # Create the table entry
         print("Adding forwarding entry for IP", dst_ipAddr, "MAC", dst_mac_addr)
-        table_entry = p4info_helper.buildTableEntry(
+        if 'no_action' in action:
+            table_entry = p4info_helper.buildTableEntry(
             table_name = FORWARDING_TABLE_NAME,
             match_fields = {"meta.next_hop_ip_add": (dst_ipAddr)},
-            action_name = "MyEgress.set_dst_and_src_mac",
+            action_name = action,
+            action_params = {}
+            )
+        else:
+            table_entry = p4info_helper.buildTableEntry(
+            table_name = FORWARDING_TABLE_NAME,
+            match_fields = {"meta.next_hop_ip_add": (dst_ipAddr)},
+            action_name = action,
             action_params = {
                 "dst_mac": dst_mac_addr
                 }
-        )
+            )
+
 
         # Write entry to table
         self.cntrl.switch_connection.WriteTableEntry(table_entry)
@@ -408,15 +430,31 @@ class ARPManager(Thread):
                         self.cntrl.send_pkt(arp_reply_pkt)
 
             # Check if packet is an ARP reply
-            # TODO - I assume here that the dst MAC was checked in data plane and this is addressed to me
             elif pkt[ARP].op == ARP_OP_REPLY:
 
                 print("ARP manager: got ARP reply")
                 # Add the new information to the forwarding table
-                self.add_forwarding_entry(
-                    dst_ipAddr = pkt[ARP].psrc,
-                    dst_mac_addr = pkt[ARP].hwsrc
+                self.add_forwarding_entry('MyEgress.set_dst_and_src_mac',
+                                          dst_ipAddr = pkt[ARP].psrc,
+                                          dst_mac_addr = pkt[ARP].hwsrc
                 )
+
+            elif pkt[CPUMetadata].ipAddrForArp != '0.0.0.0':
+                ip_to_search = pkt[CPUMetadata].ipAddrForArp
+                # We need to generate an ARP request
+                print("ARP manager: generating ARP request for", ip_to_search)
+                # We use the intended egress port
+                ingress_interface = self.cntrl.get_ingress_interface(pkt[CPUMetadata].egressPort)
+                # Build the ARP request
+                arp_req_pkt = Ether(src = self.cntrl.MAC, dst = BROADCAST_MAC_ADDR) / ARP(
+                            op = ARP_OP_REQ,
+                            hwsrc = self.cntrl.MAC,
+                            psrc = ingress_interface.ipAddr,
+                            hwdst = BROADCAST_MAC_ADDR,
+                            pdst = ip_to_search)
+                
+                self.cntrl.send_pkt(arp_req_pkt)
+
 
 
 # This class defines a thread that periodically sends out HELLO packets
@@ -513,7 +551,7 @@ class HelloManager(Thread):
                 continue
 
             # Find the ingress interface
-            ingress_interface = self.cntrl.get_ingress_interface(pkt)
+            ingress_interface = self.cntrl.get_ingress_interface(pkt[CPUMetadata].ingressPort)
 
             if self.cntrl.check_hello_pkt_validity(pkt, ingress_interface) is False:
                 print("Hello manager: received invalid HELLO packet")
@@ -622,6 +660,10 @@ class LsuPacketSender(Thread):
         # NAAMA TODO - is this necessary?
         this_routers_neighbors = topology[self.cntrl.routerID].neighbors
         for neighbor in this_routers_neighbors.values():
+            if neighbor.routerID == 0:
+                # This neighbor is a host and not a router, always exists in the routing table
+                continue
+
             self.cntrl.add_entry_routing_table(neighbor.subnet,
                                                neighbor_routers[neighbor.routerID][0],
                                                neighbor_routers[neighbor.routerID][1])
@@ -794,7 +836,7 @@ class LSUManager(Thread):
             print("LSU manager: TTL of pkt", pkt[LSU].TTL)
             if pkt[LSU].TTL <= 0:
                 continue
-            ingress_interface = self.cntrl.get_ingress_interface(pkt)
+            ingress_interface = self.cntrl.get_ingress_interface(pkt[CPUMetadata].ingressPort)
             for interface in self.cntrl.interfaces:
                 if interface.ipAddr == ingress_interface.ipAddr:
                     # Don't flood to ingress interface
@@ -870,7 +912,8 @@ class RouterController(Thread):
     def add_entry_routing_table(self, dstAddr : str, next_hop : int, port : int):
         # Make sure this entry doesn't already exist in the table
         routing_table_id = p4info_helper.get_id("tables", ROUTING_TABLE_NAME)
-        if self.entry_already_exists(routing_table_id, dstAddr, 32):
+        if self.entry_already_exists(ROUTING_TABLE_NAME, routing_table_id, (str(dstAddr), 32)):
+            print("routing entry for", dstAddr, "already exists")
             return
 
         print("Controller: adding entry for addr", dstAddr)
@@ -891,23 +934,45 @@ class RouterController(Thread):
         print("Controller: deleting entry for addr", dstAddr)
         table_entry = p4info_helper.buildTableEntry(
             table_name = "MyIngress.routing_table",
-            match_fields = {"hdr.ipv4.dstAddr": (dstAddr)},
+            match_fields = {"hdr.ipv4.dstAddr": (dstAddr, 32)},
             action_name = None
         )
 
         # Write entry to table
         self.switch_connection.DeleteTableEntry(table_entry)
 
-    def entry_already_exists(self, table_id, *args):
-        for entry in self.switch_connection.ReadTableEntries(table_id):
-            if entry.match == args:
-                return True
+    def entry_already_exists(self, table_name, table_id, keys):
+        print("checking for keys", keys)
+        for readResponse in self.switch_connection.ReadTableEntries(table_id):
+            print("checking response")
+            for entity in readResponse.entities:
+                print("checking entity")
+                if entity.HasField('table_entry'):
+                    print("entity has table entry")
+                    table_entry = entity.table_entry
+                    
+                    match_key = []
+                    match_fields = table_entry.match
+                    for field in match_fields:
+                        if table_name == FORWARDING_TABLE_NAME:
+                            match_key = socket.inet_ntoa(field.exact.value)
+                        else:
+                            # Routing Table
+                            match_key = (socket.inet_ntoa(field.lpm.value), field.lpm.prefix_len)
+
+                    if match_key == keys:
+                        return True
+                    else:
+                        print("read entry for", match_key)
         return False
 
     # This function sends an incoming packet to the appropriate queue
     def process_pkt(self, pkt):
         if ARP in pkt:
             # ARP packet
+            arp_queue.put(pkt)
+        if CPUMetadata in pkt and pkt[CPUMetadata].ipAddrForArp != '0.0.0.0':
+            # Need to generate ARP request
             arp_queue.put(pkt)
         elif Hello in pkt:
             # HELLO packet
@@ -917,10 +982,9 @@ class RouterController(Thread):
             lsu_queue.put(pkt)
 
     # Getting the ingress interface of a packet
-    def get_ingress_interface(self, pkt) -> Interface:
-        ingress_port = pkt[CPUMetadata].ingressPort
+    def get_ingress_interface(self, port) -> Interface:
         for interface in self.interfaces:
-            if interface.port == ingress_port:
+            if interface.port == port:
                 return interface
 
         # No interface matches
@@ -980,7 +1044,27 @@ class RouterController(Thread):
         address=('127.0.0.1:50051'),
         device_id=0)
         self.switch_connection.MasterArbitrationUpdate()
-        self.switch_connection.SetForwardingPipelineConfig(p4info=p4info_helper.p4info)
+        self.switch_connection.SetForwardingPipelineConfig(p4info=p4info_helper.p4info, bmv2_json_file_path="/root/bmv2/bin/router.json")
+
+    def init_tables(self):
+        if self.routerID == 1:
+            self.add_entry_routing_table(HOST_1_IP, HOST_1_IP, 0)
+            self.arp_manager.add_forwarding_entry('MyEgress.set_dst_and_src_mac', HOST_1_IP, HOST_1_MAC)
+        if self.routerID == 2:
+            self.add_entry_routing_table(HOST_2_IP, HOST_2_IP, 0)
+            self.arp_manager.add_forwarding_entry('MyEgress.set_dst_and_src_mac', HOST_2_IP, HOST_2_MAC)
+        
+        self.arp_manager.add_forwarding_entry('MyEgress.no_action', PWOSPF_HELLO_DEST)
+        self.arp_manager.add_forwarding_entry('MyEgress.no_action', '0.0.0.0')
+
+    def init_topology(self):
+        if self.routerID == 1:
+            host_neighbor = TopologyNeighbor(0, HOST_1_SUBNET, HOST_1_MASK)
+        if self.routerID == 2:
+            host_neighbor = TopologyNeighbor(0, HOST_2_SUBNET, HOST_2_MASK)
+
+        self.topology.add_neighbor_to_router(self.routerID, host_neighbor)
+        
 
     # This function defines the activity of the router controller - repeatedly sniffs for packets and distributed them
     # to the appropriate thread
@@ -988,6 +1072,11 @@ class RouterController(Thread):
         # Init and start grpc switch connection
         self.init_switch_connection()
         print("successfully connected to switch")
+
+        self.init_tables()
+        print("Successfully filled tables")
+
+        self.init_topology()
 
         # Start ARP manager
         print("Controller: Starting ARP manager")
@@ -1015,7 +1104,8 @@ class CPUMetadata(Packet):
         XShortEnumField("origEtherType", 0x0800, {0x0800: "IP", 0x0806: "ARP"}),
         # Packet ingress port
         ShortField("ingressPort", 0),
-        ShortField("egressPort", 0)
+        ShortField("egressPort", 0),
+        IPField("ipAddrForArp", "0.0.0.0")
     ]
 
 
@@ -1103,22 +1193,22 @@ if __name__ == "__main__":
         print("starting router 1")
         interfaces = [
             Interface(
-                ipAddr = "10.0.2.2",
+                ipAddr = "169.254.1.2",
+                subnetMask = "255.255.255.0",
+                helloint = HELLOINT_IN_SECS,
+                port = 0
+            ),
+            Interface(
+                ipAddr = "169.254.3.1",
                 subnetMask = "255.255.255.0",
                 helloint = HELLOINT_IN_SECS,
                 port = 1
-            ),
-            Interface(
-                ipAddr = "10.0.2.2",
-                subnetMask = "255.255.255.0",
-                helloint = HELLOINT_IN_SECS,
-                port = 3
             )
         ]
         router_controller = RouterController(
-            sw = "eth0",
+            sw = "veth0",
             routerID = 1,
-            MAC = "08:00:00:00:02:22",
+            MAC = "10:00:00:00:00:01",
             areaID = AREA_ID,
             interfaces = interfaces,
             lsuint = LSUINT_IN_SECS
@@ -1129,22 +1219,22 @@ if __name__ == "__main__":
         print("starting router 2")
         interfaces = [
             Interface(
-                ipAddr = "10.0.3.3",
+                ipAddr = "169.254.2.2",
+                subnetMask = "255.255.255.0",
+                helloint = HELLOINT_IN_SECS,
+                port = 0
+            ),
+            Interface(
+                ipAddr = "169.254.3.2",
                 subnetMask = "255.255.255.0",
                 helloint = HELLOINT_IN_SECS,
                 port = 1
-            ),
-            Interface(
-                ipAddr = "10.0.3.3",
-                subnetMask = "255.255.255.0",
-                helloint = HELLOINT_IN_SECS,
-                port = 3
             )
         ]
         router_controller = RouterController(
             sw = "veth0",
             routerID = 2,
-            MAC = "08:00:00:00:03:33",
+            MAC = "10:00:00:00:00:02",
             areaID = AREA_ID,
             interfaces = interfaces,
             lsuint = LSUINT_IN_SECS
