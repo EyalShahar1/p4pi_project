@@ -370,11 +370,7 @@ class ARPManager(Thread):
         self.cntrl = cntrl
 
     # This function creates and adds an entry to the forwarding table
-<<<<<<< Updated upstream
-    def add_forwarding_entry(self, action : str, dst_ipAddr : str, dst_mac_addr : str = ''):
-=======
     def add_forwarding_entry(self, action : str, dst_ipAddr : str, dst_mac_addr : str= ''):
->>>>>>> Stashed changes
         # Make sure this entry doesn't already exist in the table
         forwarding_table_id = p4info_helper.get_id("tables", FORWARDING_TABLE_NAME)
         if self.cntrl.entry_already_exists(FORWARDING_TABLE_NAME, forwarding_table_id, dst_ipAddr):
@@ -382,26 +378,6 @@ class ARPManager(Thread):
             return
         
         # Create the table entry
-<<<<<<< Updated upstream
-        print("Adding forwarding entry for IP", dst_ipAddr, "MAC", dst_mac_addr)
-        if 'no_action' in action:
-            table_entry = p4info_helper.buildTableEntry(
-            table_name = FORWARDING_TABLE_NAME,
-            match_fields = {"meta.next_hop_ip_add": (dst_ipAddr)},
-            action_name = action,
-            action_params = {}
-            )
-        else:
-            table_entry = p4info_helper.buildTableEntry(
-            table_name = FORWARDING_TABLE_NAME,
-            match_fields = {"meta.next_hop_ip_add": (dst_ipAddr)},
-            action_name = action,
-            action_params = {
-                "dst_mac": dst_mac_addr
-                }
-            )
-
-=======
         if 'no_action' in action:
             print("Adding forwarding entry for IP", dst_ipAddr, "MAC", dst_mac_addr)
             table_entry = p4info_helper.buildTableEntry(
@@ -421,7 +397,6 @@ class ARPManager(Thread):
                     "dst_mac": dst_mac_addr
                 }
             )
->>>>>>> Stashed changes
 
         # Write entry to table
         self.cntrl.switch_connection.WriteTableEntry(table_entry)
@@ -453,6 +428,7 @@ class ARPManager(Thread):
                         self.cntrl.send_pkt(arp_reply_pkt)
 
             # Check if packet is an ARP reply
+            # TODO - I assume here that the dst MAC was checked in data plane and this is addressed to me
             elif pkt[ARP].op == ARP_OP_REPLY:
 
                 print("ARP manager: got ARP reply")
@@ -461,23 +437,6 @@ class ARPManager(Thread):
                                           dst_ipAddr = pkt[ARP].psrc,
                                           dst_mac_addr = pkt[ARP].hwsrc
                 )
-
-            elif pkt[CPUMetadata].ipAddrForArp != '0.0.0.0':
-                ip_to_search = pkt[CPUMetadata].ipAddrForArp
-                # We need to generate an ARP request
-                print("ARP manager: generating ARP request for", ip_to_search)
-                # We use the intended egress port
-                ingress_interface = self.cntrl.get_ingress_interface(pkt[CPUMetadata].egressPort)
-                # Build the ARP request
-                arp_req_pkt = Ether(src = self.cntrl.MAC, dst = BROADCAST_MAC_ADDR) / ARP(
-                            op = ARP_OP_REQ,
-                            hwsrc = self.cntrl.MAC,
-                            psrc = ingress_interface.ipAddr,
-                            hwdst = BROADCAST_MAC_ADDR,
-                            pdst = ip_to_search)
-                
-                self.cntrl.send_pkt(arp_req_pkt)
-
 
 
 # This class defines a thread that periodically sends out HELLO packets
@@ -509,10 +468,8 @@ class HelloPacketSender(Thread):
                                       dst = PWOSPF_HELLO_DEST,
                                       proto = OSPF_PROT_NUM
                                       ) / PWOSPF(type = HELLO_TYPE,
-                                                 routerId = self.cntrl.routerID) / Hello(
-                                          networkMask = interface.subnetMask,
-                                          HelloInt = interface.helloint
-                                          )
+                                                 routerId = self.cntrl.routerID) / Hello(networkMask = interface.subnetMask,
+                                                                                         HelloInt = interface.helloint)
                 # Send out the pacekt
                 print("Hello packet sender: sending HELLO packet from", interface.ipAddr, "to port", interface.port)
                 self.cntrl.send_pkt(hello_pkt)
@@ -574,7 +531,7 @@ class HelloManager(Thread):
                 continue
 
             # Find the ingress interface
-            ingress_interface = self.cntrl.get_ingress_interface(pkt[CPUMetadata].ingressPort)
+            ingress_interface = self.cntrl.get_ingress_interface(pkt)
 
             if self.cntrl.check_hello_pkt_validity(pkt, ingress_interface) is False:
                 print("Hello manager: received invalid HELLO packet")
@@ -611,10 +568,11 @@ class LsuPacketSender(Thread):
 
     # This function runs the djikstra algorithm on the network topology, and returns the predecessors - the "next hop"
     # for each router
-    def run_djikstra(self)-> Tuple[Dict[str,int], Dict[int,int]]:
+    def run_djikstra(self)-> Dict[int,int]:
         topology = self.cntrl.topology.get()
         # The currently unvisited nodes in the network
         unvisited_nodes = list(topology.keys())
+        # The predecessors for each subnet
         # The predecessors for each router (tree)
         router_predecessors = {key: None for key in unvisited_nodes}
         # A dictionary of all minimal distances for the network nodes
@@ -663,7 +621,7 @@ class LsuPacketSender(Thread):
     def fill_routing_table(self,
                            topology: Topology,
                            router_predecessors : Dict[int,int]):
-        added_subnets = set()
+        found_subnets = set()
 
         # Fill a set with the router IDs of all neighbors
         neighbor_routers = {}
@@ -672,42 +630,23 @@ class LsuPacketSender(Thread):
                 neighbor_routers[neighbor.routerID] = (neighbor.ipAddr, interface.port)
                 self.cntrl.add_entry_routing_table(neighbor.ipAddr, 32, neighbor.ipAddr, interface.port)
 
-<<<<<<< Updated upstream
-        # First, add this neighbors routers
-        # NAAMA TODO - is this necessary?
-        this_routers_neighbors = topology[self.cntrl.routerID].neighbors
-        for neighbor in this_routers_neighbors.values():
-            if neighbor.routerID == 0:
-                # This neighbor is a host and not a router, always exists in the routing table
-                continue
-
-            self.cntrl.add_entry_routing_table(neighbor.subnet,
-                                               neighbor_routers[neighbor.routerID][0],
-                                               neighbor_routers[neighbor.routerID][1])
-
-        # TODO - make sure we don't get duplicate entries
-=======
->>>>>>> Stashed changes
         # Now add the rest of the routers and their subnets that aren't routers
         for routerID in router_predecessors.keys():
             pred_router = router_predecessors.get(routerID)
             if pred_router is None:
-                # Predecessor of this subnet is this router - already added
+                # This router - already added all its neighbors
                 continue
             while pred_router not in neighbor_routers.keys():
                 pred_router = router_predecessors[pred_router]
 
             router_neighbors = topology.get()[routerID].neighbors.values()
             for neighbor in router_neighbors:
-                neighbor_subnet = neighbor.subnet
-                if neighbor_subnet not in added_subnets:
-                    self.cntrl.add_entry_routing_table(neighbor_subnet,
+                if neighbor.subnet not in found_subnets:
+                    self.cntrl.add_entry_routing_table(neighbor.subnet,
                                                        24,
-                                                       neighbor_routers[routerID][0],
-                                                       neighbor_routers[routerID][1])
-                    added_subnets.add(neighbor_subnet)
-
-
+                                                       neighbor_routers[pred_router][0],
+                                                       neighbor_routers[pred_router][1])
+                    
     # This function defines the activity of the LSU packet sender - repeatedly sends out LSU packets out of all
     # interfaces then sleeps for LSUint seconds, or until a change in topology occurres (the event is triggered)
     def run(self):
@@ -864,7 +803,7 @@ class LSUManager(Thread):
             print("LSU manager: TTL of pkt", pkt[LSU].TTL)
             if pkt[LSU].TTL <= 0:
                 continue
-            ingress_interface = self.cntrl.get_ingress_interface(pkt[CPUMetadata].ingressPort)
+            ingress_interface = self.cntrl.get_ingress_interface(pkt)
             for interface in self.cntrl.interfaces:
                 if interface.ipAddr == ingress_interface.ipAddr:
                     # Don't flood to ingress interface
@@ -961,11 +900,7 @@ class RouterController(Thread):
         print("Controller: deleting entry for addr", dstAddr)
         table_entry = p4info_helper.buildTableEntry(
             table_name = "MyIngress.routing_table",
-<<<<<<< Updated upstream
-            match_fields = {"hdr.ipv4.dstAddr": (dstAddr, 32)},
-=======
             match_fields = {"hdr.ipv4.dstAddr": (str(dstAddr) , 32)},
->>>>>>> Stashed changes
             action_name = None
         )
 
@@ -973,7 +908,6 @@ class RouterController(Thread):
         self.switch_connection.DeleteTableEntry(table_entry)
 
     def entry_already_exists(self, table_name, table_id, keys):
-<<<<<<< Updated upstream
         print("checking for keys", keys)
         for readResponse in self.switch_connection.ReadTableEntries(table_id):
             print("checking response")
@@ -982,7 +916,7 @@ class RouterController(Thread):
                 if entity.HasField('table_entry'):
                     print("entity has table entry")
                     table_entry = entity.table_entry
-                    
+
                     match_key = []
                     match_fields = table_entry.match
                     for field in match_fields:
@@ -997,33 +931,11 @@ class RouterController(Thread):
                     else:
                         print("read entry for", match_key)
         return False
-=======
-        for readResponse in self.switch_connection.ReadTableEntries(table_id):
-            for entity in readResponse.entities:
-                if entity.HasField('table_entry'):
-                    table_entry = entity.table_entry
->>>>>>> Stashed changes
-
-                    match_key = []
-                    match_fields = table_entry.match
-                    for field in match_fields:
-                        if table_name == FORWARDING_TABLE_NAME:
-                            match_key = socket.inet_ntoa(field.exact.value)
-                        else:
-                            # Routing Table
-                            match_key = (socket.inet_ntoa(field.lpm.value), field.lpm.prefix_len)
-
-                    if match_key == keys:
-                        return True
-        return False
     
     # This function sends an incoming packet to the appropriate queue
     def process_pkt(self, pkt):
         if ARP in pkt:
             # ARP packet
-            arp_queue.put(pkt)
-        if CPUMetadata in pkt and pkt[CPUMetadata].ipAddrForArp != '0.0.0.0':
-            # Need to generate ARP request
             arp_queue.put(pkt)
         elif Hello in pkt:
             # HELLO packet
@@ -1033,9 +945,10 @@ class RouterController(Thread):
             lsu_queue.put(pkt)
 
     # Getting the ingress interface of a packet
-    def get_ingress_interface(self, port) -> Interface:
+    def get_ingress_interface(self, pkt) -> Interface:
+        ingress_port = pkt[CPUMetadata].ingressPort
         for interface in self.interfaces:
-            if interface.port == port:
+            if interface.port == ingress_port:
                 return interface
 
         # No interface matches
@@ -1099,16 +1012,6 @@ class RouterController(Thread):
 
     def init_tables(self):
         if self.routerID == 1:
-<<<<<<< Updated upstream
-            self.add_entry_routing_table(HOST_1_IP, HOST_1_IP, 0)
-            self.arp_manager.add_forwarding_entry('MyEgress.set_dst_and_src_mac', HOST_1_IP, HOST_1_MAC)
-        if self.routerID == 2:
-            self.add_entry_routing_table(HOST_2_IP, HOST_2_IP, 0)
-            self.arp_manager.add_forwarding_entry('MyEgress.set_dst_and_src_mac', HOST_2_IP, HOST_2_MAC)
-        
-        self.arp_manager.add_forwarding_entry('MyEgress.no_action', PWOSPF_HELLO_DEST)
-        self.arp_manager.add_forwarding_entry('MyEgress.no_action', '0.0.0.0')
-=======
             self.add_entry_routing_table(HOST_1_IP, 32, HOST_1_IP, 0)
             self.arp_manager.add_forwarding_entry('MyEgress.set_dst_and_src_mac', HOST_1_IP, HOST_1_MAC)
             self.arp_manager.add_forwarding_entry('MyEgress.set_dst_and_src_mac', "169.254.3.2", "10:00:00:00:00:02")
@@ -1118,7 +1021,6 @@ class RouterController(Thread):
             self.arp_manager.add_forwarding_entry('MyEgress.set_dst_and_src_mac', "169.254.3.1", "10:00:00:00:00:01")
 
         self.arp_manager.add_forwarding_entry('MyEgress.no_action', PWOSPF_HELLO_DEST)
->>>>>>> Stashed changes
 
     def init_topology(self):
         if self.routerID == 1:
@@ -1127,10 +1029,6 @@ class RouterController(Thread):
             host_neighbor = TopologyNeighbor(0, HOST_2_SUBNET, HOST_2_MASK)
 
         self.topology.add_neighbor_to_router(self.routerID, host_neighbor)
-<<<<<<< Updated upstream
-        
-=======
->>>>>>> Stashed changes
 
     # This function defines the activity of the router controller - repeatedly sniffs for packets and distributed them
     # to the appropriate thread
@@ -1170,8 +1068,7 @@ class CPUMetadata(Packet):
         XShortEnumField("origEtherType", 0x0800, {0x0800: "IP", 0x0806: "ARP"}),
         # Packet ingress port
         ShortField("ingressPort", 0),
-        ShortField("egressPort", 0),
-        IPField("ipAddrForArp", "0.0.0.0")
+        ShortField("egressPort", 0)
     ]
 
 
