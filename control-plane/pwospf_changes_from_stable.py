@@ -140,6 +140,8 @@ HOST_2_MAC = '5c:f9:dd:6c:5e:88'
 HOST_2_SUBNET = '169.254.2.0'
 HOST_2_MASK = '255.255.255.0'
 
+NEED_ARP_REQ = 1
+
 
 ########################################
 #---------- Sniff() function ----------#
@@ -437,6 +439,26 @@ class ARPManager(Thread):
                                           dst_ipAddr = pkt[ARP].psrc,
                                           dst_mac_addr = pkt[ARP].hwsrc
                 )
+
+            elif CPUMetadata in pkt and pkt[CPUMetadata].needArpRequest == NEED_ARP_REQ:
+                # Generate ARP request
+                
+                # Find the egress interface
+                for interface in self.cntrl.interfaces:
+                    if interface.port == pkt[CPUMetadata].egressPort:
+                        src_ip = interface.ipAddr
+
+                arp_req_pkt = Ether(src = self.cntrl.MAC, dst = BROADCAST_MAC_ADDR) / ARP(
+                            op = ARP_OP_REQ,
+                            hwsrc = self.cntrl.MAC,
+                            psrc = src_ip,
+                            hwdst = BROADCAST_MAC_ADDR,
+                            pdst = pkt[IP].dst)
+                
+                # Send the ARP request
+                print("ARP manager: sending ARP request for IP", pkt[IP].dst)
+                self.cntrl.send_pkt(arp_req_pkt)
+
 
 
 # This class defines a thread that periodically sends out HELLO packets
@@ -936,6 +958,9 @@ class RouterController(Thread):
     def process_pkt(self, pkt):
         if ARP in pkt:
             # ARP packet
+            arp_queue.put(pkt)
+        elif CPUMetadata in pkt and pkt[CPUMetadata].needArpRequest == NEED_ARP_REQ:
+            # Need to generate ARP request
             arp_queue.put(pkt)
         elif Hello in pkt:
             # HELLO packet
