@@ -19,9 +19,6 @@ const bit<16> TYPE_IPV4         = 0x0800;
 const bit<16> TYPE_ARP          = 0x0806;
 const bit<16> TYPE_CPU_METADATA = 0x080a;
 
-// Used for sending packets to CPU
-const ip4Addr_t INVALID_IP_ADDR = 0x0a000000;
-
 /*****     HEADERS     *****/
 
 // standard Ethernet header
@@ -38,7 +35,6 @@ header cpu_t {
     port_t      ingress_port;
     bit<7>      egress_padding;
     port_t      egress_port;
-    ip4Addr_t   ip_addr_for_arp;
 }
 
 // ARP header
@@ -82,6 +78,7 @@ header ospf_t {
     bit<16> auth_type;
     bit<64> auth;
 }
+
 // Packet headers
 struct headers {
     ethernet_t          ethernet;
@@ -170,43 +167,32 @@ control MyIngress(inout headers hdr,
         mark_to_drop(standard_metadata);
     }
 
-    // For PWOSPF packets and ARP packets
     action send_to_cpu() {
         // Send to CPU port
         standard_metadata.egress_spec = CPU_PORT;
-        // Enable use of the CPU header
         hdr.cpu.setValid();
-        // Switch the ether types 
+        // Keep original etherType
         hdr.cpu.etherType = hdr.ethernet.etherType;
-        hdr.ethernet.etherType = TYPE_CPU_METADATA;
-        // Pass the ingress port to CPU
+        // Pass ingress port to CPU
         hdr.cpu.ingress_port = standard_metadata.ingress_port;
-        // Make sure CPU doesn't think this needs an ARP request
-        hdr.cpu.ip_addr_for_arp = (ip4Addr_t) 0;
-        // Don't want the egress flow to change anything about the packet
-        meta.next_hop_ip_add = INVALID_IP_ADDR;
-    }
-
-    // For packets exiting CPU
-    action flood() {
-        // Use the egress port the CPU chose
-        standard_metadata.egress_spec = hdr.cpu.egress_port;
-        // Restore the ether type
-        hdr.ethernet.etherType = hdr.cpu.etherType;
-        if (hdr.arp.isValid()) {
-            // This is an ARP request, so don't want the egress flow to search for a known MAC address
-            meta.next_hop_ip_add = INVALID_IP_ADDR;
-        } else {
-            // In other cases, CPU uses known IP addresses
+        hdr.ethernet.etherType = TYPE_CPU_METADATA;
         meta.next_hop_ip_add = hdr.ipv4.dstAddr;
-        }
     }
 
-    // For regular packets
+    action send_from_cpu() {
+        // Send to the CPU instructed egress port
+        standard_metadata.egress_spec = hdr.cpu.egress_port;
+        // Restore old etherType
+        hdr.ethernet.etherType = hdr.cpu.etherType;
+        // Packets from CPU  already have the correct destination address
+        meta.next_hop_ip_add = hdr.ipv4.dstAddr;
+    }
+
+    // this action changes our next hop based on the data from the routing table
+    // the next hop address will determine the destination MAC address
     action ipv4_forward(ip4Addr_t next_hop, port_t port) {
         standard_metadata.egress_spec = port;
         meta.next_hop_ip_add = next_hop;
-        // Decrease TTL
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
 
@@ -218,7 +204,7 @@ control MyIngress(inout headers hdr,
 
         actions = {
             ipv4_forward;
-            flood;
+            send_from_cpu;
             drop;
         }
         size = 256;
@@ -234,19 +220,18 @@ control MyIngress(inout headers hdr,
             drop(); // makrked the packet to be dropped
             return;
         }
-        if (hdr.cpu.isValid()) { // Packet came from CPU
-            flood();
+        if (hdr.cpu.isValid()) {
+            send_from_cpu();
             hdr.cpu.setInvalid();
             return;
         }
         if (hdr.ethernet.etherType == TYPE_ARP || hdr.ipv4.prot == PROTO_OSPF) {
             // Incoming OSPF and ARP packets are always sent to CPU
             send_to_cpu();
-            return;
+            return; // wont go to routing table
         }
-        // If packet is not from CPU and not ARP/OSPF - apply regular routing
+        // If packet is not from CPU and not ARP/OSPF - apply routing
         routing_table.apply();
-        return;
     }
 }
 
@@ -254,29 +239,16 @@ control MyEgress(inout headers hdr,
                  inout metadata meta,
                  inout standard_metadata_t standard_metadata) {
 
-    // For known IP addresses - set the matching MAC addresses
     action set_dst_and_src_mac(macAddr_t dst_mac) {
         hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
         hdr.ethernet.dstAddr = dst_mac;
     }
 
-    // For unknown MAC addresses
     action generate_arp_req() {
-        // Send to CPU port
         standard_metadata.egress_spec = CPU_PORT;
-        // Enable use of the CPU header
-        hdr.cpu.setValid();
-        // Switch the ether types 
-        hdr.cpu.etherType = hdr.ethernet.etherType;
-        hdr.ethernet.etherType = TYPE_CPU_METADATA;
-        // Pass the intended egress port to the CPU
-        hdr.cpu.egress_port = standard_metadata.egress_spec;
-        // Pass the unknown IP address to CPU
-        hdr.cpu.ip_addr_for_arp = meta.next_hop_ip_add;
     }
 
     action no_action() {}
-
     table forwarding_table {
         key = {meta.next_hop_ip_add: exact; }
 
@@ -289,6 +261,10 @@ control MyEgress(inout headers hdr,
         default_action = generate_arp_req();
     }
     apply {
+        if (standard_metadata.egress_spec == CPU_PORT) {
+            // No need for MAC address - this will be sent to CPU
+            return;
+        }
         forwarding_table.apply();
      }
 }
@@ -312,7 +288,6 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
             hdr.ipv4.dstAddr },
             hdr.ipv4.hdr_checksum,
             HashAlgorithm.csum16);
-        // can add more cases if we'll have more packets type with check sum
         }
 }
 
