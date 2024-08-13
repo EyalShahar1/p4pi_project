@@ -19,6 +19,8 @@ const bit<16> TYPE_IPV4         = 0x0800;
 const bit<16> TYPE_ARP          = 0x0806;
 const bit<16> TYPE_CPU_METADATA = 0x080a;
 
+const bit<8> NEED_ARP_REQUEST   = 1;
+
 /*****     HEADERS     *****/
 
 // standard Ethernet header
@@ -35,6 +37,7 @@ header cpu_t {
     port_t      ingress_port;
     bit<7>      egress_padding;
     port_t      egress_port;
+    bit<8>      need_arp_request;
 }
 
 // ARP header

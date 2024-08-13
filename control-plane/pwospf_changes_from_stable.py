@@ -1068,7 +1068,8 @@ class CPUMetadata(Packet):
         XShortEnumField("origEtherType", 0x0800, {0x0800: "IP", 0x0806: "ARP"}),
         # Packet ingress port
         ShortField("ingressPort", 0),
-        ShortField("egressPort", 0)
+        ShortField("egressPort", 0),
+        ByteField("needArpRequest", 0)
     ]
 
 
