@@ -588,19 +588,27 @@ class LsuPacketSender(Thread):
         # Event to wait on for a change (adding/removing) in neighbors
         self.event = event
 
-    # This function runs the djikstra algorithm on the network topology, and returns the predecessors - the "next hop"
-    # for each router
+    # This function runs the djikstra algorithm on the network topology, calculates the "next hop" predecessors
+    # for all subnets, and adds them to the routing table
     def run_djikstra(self)-> Dict[int,int]:
+        # Fill a dictionary with the router IDs of all neighbors, and add neighbors to routing table
+        neighbor_routers = {}
+        for interface in self.cntrl.interfaces:
+            for neighbor in interface.neighbors.values():
+                neighbor_routers[neighbor.routerID] = (neighbor.ipAddr, interface.port)
+                self.cntrl.add_entry_routing_table(neighbor.ipAddr, 32, neighbor.ipAddr, interface.port)
+
         topology = self.cntrl.topology.get()
         # The currently unvisited nodes in the network
         unvisited_nodes = list(topology.keys())
-        # The predecessors for each subnet
         # The predecessors for each router (tree)
         router_predecessors = {key: None for key in unvisited_nodes}
         # A dictionary of all minimal distances for the network nodes
         distances = {key : float('inf') for key in unvisited_nodes}
         # Initialize this router's distance to 0
         distances[self.cntrl.routerID] = 0
+        # Subnets already added to the routing table
+        found_subnets = set()
 
         # Initialize a heap (queue) of all nodes and their distances
         nodes_heap = []
@@ -636,38 +644,23 @@ class LsuPacketSender(Thread):
                     # Update the router's predecessor
                     router_predecessors[neighbor_id] = current_routerID
 
-        # Return the predecessors of all routers
-        return router_predecessors
+            if current_routerID != self.cntrl.routerID:
+                # Find the "next hop" for this router's subnets, since the current router is not a neighbor
+                next_hop_routerID = router_predecessors.get(current_routerID)
+                # Make sure the predecessor of the current router is a neighbor of this router
+                while next_hop_routerID not in neighbor_routers.keys():
+                        next_hop_routerID = router_predecessors[next_hop_routerID]
+            else:
+                # The current router is a neighbor, so it is the next hop
+                next_hop_routerID = current_routerID
 
-    # This function creates and adds an entry to the routing table
-    def fill_routing_table(self,
-                           topology: Topology,
-                           router_predecessors : Dict[int,int]):
-        found_subnets = set()
-
-        # Fill a set with the router IDs of all neighbors
-        neighbor_routers = {}
-        for interface in self.cntrl.interfaces:
-            for neighbor in interface.neighbors.values():
-                neighbor_routers[neighbor.routerID] = (neighbor.ipAddr, interface.port)
-                self.cntrl.add_entry_routing_table(neighbor.ipAddr, 32, neighbor.ipAddr, interface.port)
-
-        # Now add the rest of the routers and their subnets that aren't routers
-        for routerID in router_predecessors.keys():
-            pred_router = router_predecessors.get(routerID)
-            if pred_router is None:
-                # This router - already added all its neighbors
-                continue
-            while pred_router not in neighbor_routers.keys():
-                pred_router = router_predecessors[pred_router]
-
-            router_neighbors = topology.get()[routerID].neighbors.values()
+            router_neighbors = topology[current_routerID].neighbors.values()
             for neighbor in router_neighbors:
                 if neighbor.subnet not in found_subnets:
                     self.cntrl.add_entry_routing_table(neighbor.subnet,
                                                        24,
-                                                       neighbor_routers[pred_router][0],
-                                                       neighbor_routers[pred_router][1])
+                                                       neighbor_routers[next_hop_routerID][0],
+                                                       neighbor_routers[next_hop_routerID][1])
                     
     # This function defines the activity of the LSU packet sender - repeatedly sends out LSU packets out of all
     # interfaces then sleeps for LSUint seconds, or until a change in topology occurres (the event is triggered)
@@ -677,9 +670,7 @@ class LsuPacketSender(Thread):
             if self.event.is_set:
                 # We woke up because of a topology change, run run_djikstra
                 print("LSU packet sender: running djikstra")
-                router_predecessors = self.run_djikstra()
-                self.fill_routing_table(self.cntrl.topology.get(),
-                                        router_predecessors)
+                self.run_djikstra()
                 self.event.clear()
 
             # Check if there are outdated neighbors in topology
