@@ -249,9 +249,17 @@ control MyEgress(inout headers hdr,
 
     action generate_arp_req() {
         standard_metadata.egress_spec = CPU_PORT;
+        hdr.cpu.setValid();
+        // Pass the intended egress port to CPU
+        hdr.cpu.egress_port = standard_metadata.ingress_port;
+        // Mark the packet as needing an ARP request
+        hdr.cpu.need_arp_request = NEED_ARP_REQUEST;
+        // Pass the IP address to CPU in ipv4 packet
+        hdr.ipv4.dstAddr = meta.next_hop_ip_add;
     }
 
     action no_action() {}
+
     table forwarding_table {
         key = {meta.next_hop_ip_add: exact; }
 
