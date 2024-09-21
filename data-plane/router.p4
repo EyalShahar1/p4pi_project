@@ -219,7 +219,7 @@ control MyIngress(inout headers hdr,
 
     apply {
         // Invalid packets
-        if (!hdr.ethernet.isValid() || !hdr.ipv4.isValid()) {
+        if (!hdr.ethernet.isValid()) {
             drop(); // makrked the packet to be dropped
             return;
         }

@@ -214,7 +214,7 @@ class TopologyNeighbor:
 # its links. The interface is defined by its IP address, its subnet mask, the interval for sending out HELLO packets to
 # all its neighbors (which in actuality is constant for the entire network), and its port number.
 class Interface:
-    def __init__(self, ipAddr : str, subnetMask : str, helloint : int, port : int, neighbors : Dict[str,Neighbor] = {}):
+    def __init__(self, ipAddr : str, subnetMask : str, helloint : int, port : int, neighbors : Dict[str,Neighbor]):
         # The IP address of the interface
         self.ipAddr = ipAddr
 
@@ -230,7 +230,7 @@ class Interface:
         # A dictionary of neighbors. Every instance starts with an empty dictionary. The key is the IP of the neighbor,
         # and the value is a Neighbor instance.
         # TODO - decide if I need to lock this dictionary
-        self.neighbors = neighbors
+        self.neighbors = {}
 
     # Function for adding a new neighbor to the interface's list
     def add_neighbor(self, cntrl : RouterController, neighbor_routerID : int, neighbor_ip : str, neighbor_mask : str):
