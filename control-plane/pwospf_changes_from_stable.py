@@ -51,11 +51,6 @@ arp_queue = Queue()
 hello_queue = Queue()
 lsu_queue = Queue()
 
-# Used for adding multicast group for flooding
-# NAAMA TODO - might not be needed
-multicast_group_id = 1
-egress_ports = [0, 1]
-
 # The p4info helper used to add p4 table entries - global
 p4info_helper = p4runtime_lib.helper.P4InfoHelper('/root/bmv2/bin/router.p4info.txt')
 
@@ -84,9 +79,6 @@ PWOSPF_HELLO_DEST = '224.0.0.5'
 # The type code of CPU metadata packets
 TYPE_CPU_METADATA = 0x080a
 
-# Type code for IPV4 packets
-TYPE_IPV4 = 0x0800
-
 # The broadcast MAC address
 BROADCAST_MAC_ADDR = 'ff:ff:ff:ff:ff:ff'
 
@@ -110,9 +102,6 @@ INVALID_SEQUENCE_NUM = 0
 
 # PWOSPF protocol version number
 VERSION_NUM = 2
-
-# Invalid router ID
-INVALID_routerID = 0
 
 # The constant and unused authentication type and authentication value for all network routers and packets
 AUTHENTICATION_TYPE = 0
@@ -140,6 +129,7 @@ HOST_2_MAC = '5c:f9:dd:6c:5e:88'
 HOST_2_SUBNET = '169.254.2.0'
 HOST_2_MASK = '255.255.255.0'
 
+# Wether the packet was passed to the control plane to generate an ARP request
 NEED_ARP_REQ = 1
 
 
@@ -229,15 +219,14 @@ class Interface:
 
         # A dictionary of neighbors. Every instance starts with an empty dictionary. The key is the IP of the neighbor,
         # and the value is a Neighbor instance.
-        # TODO - decide if I need to lock this dictionary
         self.neighbors = {}
 
     # Function for adding a new neighbor to the interface's list
     def add_neighbor(self, cntrl : RouterController, neighbor_routerID : int, neighbor_ip : str, neighbor_mask : str):
+        print("Interface: Adding router", neighbor_routerID, "as neighbor for interface", self.ipAddr)
         # Create the neighbor instance for the new neighbor
         new_neighbor = Neighbor(neighbor_routerID, neighbor_ip)
         # Add it to interface's neighbor list
-        print("Interface: Adding router", neighbor_routerID, "as neighbor for interface", self.ipAddr)
         self.neighbors[neighbor_ip] = new_neighbor
         # Add this router to the topology
         cntrl.topology.add_router(neighbor_routerID, TopologyRouterInfo())
@@ -430,7 +419,6 @@ class ARPManager(Thread):
                         self.cntrl.send_pkt(arp_reply_pkt)
 
             # Check if packet is an ARP reply
-            # TODO - I assume here that the dst MAC was checked in data plane and this is addressed to me
             elif pkt[ARP].op == ARP_OP_REPLY:
 
                 print("ARP manager: got ARP reply")
@@ -639,7 +627,6 @@ class LsuPacketSender(Thread):
                     # Update the neighbor's minimal distance
                     distances[neighbor_id] = new_distance
                     # Update the neighbor's distance in the heap
-                    # TODO - make sure I don't get duplicates
                     heapq.heappush(nodes_heap, (new_distance, neighbor_id))
                     # Update the router's predecessor
                     router_predecessors[neighbor_id] = current_routerID
@@ -758,11 +745,7 @@ class LSUManager(Thread):
             topology = self.cntrl.topology.get()
             router_info = topology.get(src_routerID)
             if router_info is None:
-                # First time we hear of this router, add it
-                # NAAMA TODO - what about unknown neighbors?
-                self.cntrl.topology.add_router(src_routerID, TopologyRouterInfo())
-                topology = self.cntrl.topology.get()
-                router_info = topology[src_routerID]
+                continue
 
             curr_seq_num = router_info.seq_num
             src_router_neighbors = router_info.neighbors
@@ -779,7 +762,6 @@ class LSUManager(Thread):
             for LSUad in pkt[LSU].LSUads:
                 # Get the topology neighbor that matches this LSUad
                 topology_neighbor = src_router_neighbors.get(LSUad.routerdID)
-                # NAAMA TODO - conflicting updates?
                 if topology_neighbor is None:
                     # New neighbor, add it
                     new_neighbor = TopologyNeighbor(LSUad.routerID,
@@ -841,7 +823,7 @@ class RouterController(Thread):
         # Call the Thread class initializer
         super(RouterController, self).__init__()
 
-        # TODO - document
+        # The interface to send packets to the data plane out of
         self.sw = sw
 
         # The router ID of the router
@@ -862,7 +844,7 @@ class RouterController(Thread):
         # Sequence number for outgoing LSU packets
         self.lsu_seq = 0
 
-        # TODO - document
+        # The start delay time for this router
         self.start_wait = start_wait
 
         # Stop event for sniffing packets
@@ -974,7 +956,6 @@ class RouterController(Thread):
     def check_pwospf_pkt_validity(self, pkt) -> bool:
         if pkt[PWOSPF].version != VERSION_NUM:
             return False
-        # TODO - check checksum
         if pkt[PWOSPF].areaID != AREA_ID:
             return False
         if pkt[PWOSPF].autype != AUTHENTICATION_TYPE:
@@ -1117,7 +1098,6 @@ class Hello(PWOSPF):
     name = "Hello"
     fields_desc = [
         # The network mask of the source
-        # TODO - might need to be 0xFFFFFFFF
         IPField("networkMask", "255.255.255.0"),
         # Helloint interval
         ShortField("HelloInt", HELLOINT_IN_SECS),
@@ -1150,9 +1130,7 @@ class LSU(PWOSPF):
         # Number of advertisments
         LongField("numAds", 0),
         # Advertisments payload
-        # TODO - maybe fieldlistfield
         PacketListField("LSUads", None, LSUad)
-        # option - FieldListField("ads", [], LSUad, count_from=lambda pkt: len(pkt.ads)
     ]
 
 

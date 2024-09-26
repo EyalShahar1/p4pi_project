@@ -179,7 +179,6 @@ control MyIngress(inout headers hdr,
         // Pass ingress port to CPU
         hdr.cpu.ingress_port = standard_metadata.ingress_port;
         hdr.ethernet.etherType = TYPE_CPU_METADATA;
-        meta.next_hop_ip_add = hdr.ipv4.dstAddr;
     }
 
     action send_from_cpu() {
@@ -189,6 +188,7 @@ control MyIngress(inout headers hdr,
         hdr.ethernet.etherType = hdr.cpu.etherType;
         // Packets from CPU  already have the correct destination address
         meta.next_hop_ip_add = hdr.ipv4.dstAddr;
+        hdr.cpu.setInvalid();
     }
 
     // this action changes our next hop based on the data from the routing table
@@ -198,49 +198,6 @@ control MyIngress(inout headers hdr,
         meta.next_hop_ip_add = next_hop;
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
-
-    /*****     TABLES     *****/
-
-    // Destination IP address -> next hop IP address, output port
-    table routing_table {
-        key = {hdr.ipv4.dstAddr: lpm; }
-
-        actions = {
-            ipv4_forward;
-            send_from_cpu;
-            drop;
-        }
-        size = 256;
-        default_action = drop;
-    }
-
-
-    /*****     APPLY     *****/
-
-    apply {
-        // Invalid packets
-        if (!hdr.ethernet.isValid()) {
-            drop(); // makrked the packet to be dropped
-            return;
-        }
-        if (hdr.cpu.isValid()) {
-            send_from_cpu();
-            hdr.cpu.setInvalid();
-            return;
-        }
-        if (hdr.ethernet.etherType == TYPE_ARP || hdr.ipv4.prot == PROTO_OSPF) {
-            // Incoming OSPF and ARP packets are always sent to CPU
-            send_to_cpu();
-            return; // wont go to routing table
-        }
-        // If packet is not from CPU and not ARP/OSPF - apply routing
-        routing_table.apply();
-    }
-}
-
-control MyEgress(inout headers hdr,
-                 inout metadata meta,
-                 inout standard_metadata_t standard_metadata) {
 
     action set_dst_and_src_mac(macAddr_t dst_mac) {
         hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
@@ -260,6 +217,22 @@ control MyEgress(inout headers hdr,
 
     action no_action() {}
 
+    /*****     TABLES     *****/
+
+    // Destination IP address -> next hop IP address, output port
+    table routing_table {
+        key = {hdr.ipv4.dstAddr: lpm; }
+
+        actions = {
+            ipv4_forward;
+            send_from_cpu;
+            drop;
+        }
+        size = 256;
+        default_action = drop;
+    }
+
+    // Next hop IP address -> destination MAC address
     table forwarding_table {
         key = {meta.next_hop_ip_add: exact; }
 
@@ -271,13 +244,38 @@ control MyEgress(inout headers hdr,
         size = 256;
         default_action = generate_arp_req();
     }
+
+
+    /*****     APPLY     *****/
+
     apply {
-        if (standard_metadata.egress_spec == CPU_PORT) {
-            // No need for MAC address - this will be sent to CPU
+        // Invalid packets
+        if (!hdr.ethernet.isValid()) {
+            drop(); // makrked the packet to be dropped
             return;
         }
+        if (hdr.cpu.isValid()) {
+            send_from_cpu();
+            forwarding_table.apply();
+            return;
+        }
+        if (hdr.ethernet.etherType == TYPE_ARP || hdr.ipv4.prot == PROTO_OSPF) {
+            // Incoming OSPF and ARP packets are always sent to CPU
+            send_to_cpu();
+            return; // wont go to routing table
+        }
+        // If packet is not from CPU and not ARP/OSPF - apply routing
+        routing_table.apply();
         forwarding_table.apply();
-     }
+    }
+}
+
+control MyEgress(inout headers hdr,
+                 inout metadata meta,
+                 inout standard_metadata_t standard_metadata) {
+
+    
+    apply {}
 }
 
 control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
